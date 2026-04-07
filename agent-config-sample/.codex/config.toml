@@ -1,0 +1,22 @@
+[sandbox_workspace_write]
+network_access = true
+
+
+
+[mcp_servers.chrome-devtools]
+command = "npx"
+args = [
+    "-y",
+    "chrome-devtools-mcp@latest",
+    # Replace this with your local absolute path to the wsl-chrome-bridge executable.
+    # Example (mise shim): /home/<your-user>/.local/share/mise/shims/wsl-chrome-bridge
+    "--executablePath",
+    "<REPLACE_WITH_ABSOLUTE_PATH_TO_WSL_CHROME_BRIDGE>",
+    "--chrome-arg=--window-size=720,400",
+    "--chrome-arg=--new-window",
+    "--chrome-arg=--lang=zh-TW",
+    "--chrome-arg=--bridge-remote-debugging-port=9222",
+    "--chrome-arg=--bridge-debug-file=/tmp/wsl-chrome-bridge-debug.log",
+    "--no-sandbox"
+]
+enabled = true
