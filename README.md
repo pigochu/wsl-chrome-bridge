@@ -1,7 +1,7 @@
 # wsl-chrome-bridge
 
 <p>
-  <a href="./README-TW.md">
+  <a href="./README-zh.md">
     <strong><span style="font-size: 1.2em;">[繁體中文說明請按此]</span></strong>
   </a>
 </p>
