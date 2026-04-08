@@ -69,7 +69,6 @@ args = [
     "--chrome-arg=--new-window",
     "--chrome-arg=--user-data-dir=%TEMP%\\wsl-chrome-bridge\\chrome-profile-test",
     "--chrome-arg=--bridge-remote-debugging-port=9222",
-    "--chrome-arg=--bridge-debug-file=/tmp/wsl-chrome-bridge-debug.log",
     "--no-sandbox"
 ]
 enabled = true
