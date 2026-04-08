@@ -19,7 +19,7 @@
     "dist"
   ],
   "bin": {
-    "wsl-chrome-bridge": "./dist/main.js"
+    "wsl-chrome-bridge": "dist/main.js"
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json && chmod 755 dist/main.js",
