@@ -74,6 +74,7 @@ enabled = true
 
 此範例會於 Windows 開啟 Chrome 時指定 port 9222 供 `wsl-chrome-bridge` 連接並與 `chrome-devtools-mcp` 互相收發資料。
 
+> [!NOTE]
 > FAQ 章節有介紹 `--executablePath` 的路徑尋找的方式。
 
 

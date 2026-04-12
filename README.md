@@ -78,6 +78,7 @@ enabled = true
 
 In this example, Windows Chrome is launched with port `9222`, and `wsl-chrome-bridge` relays traffic between Windows Chrome and `chrome-devtools-mcp`.
 
+> [!NOTE]
 > See the FAQ for how to locate `--executablePath`.
 
 ## Development Stack
