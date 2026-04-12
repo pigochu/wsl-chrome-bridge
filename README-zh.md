@@ -2,7 +2,7 @@
 
 本專案主要提供一支 CLI `wsl-chrome-bridge`。
 
-在 `chrome-devtools-mcp` 眼中，`wsl-chrome-bridge` 將會是一個可執行的 Chrome。
+在 [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp) 眼中，`wsl-chrome-bridge` 將會是一個可執行的 Chrome。
 `wsl-chrome-bridge` 會在 WSL 端提供 DevTools 連線入口，並把 CDP 訊息橋接到 Windows Chrome。
 
 原有 `chrome-devtools-mcp` 的設定方式，只需調整 `--executablePath` 並增加特定參數，即可讓 WSL 下的 Agent 調用 Windows Chrome，且無須做任何系統層級的設定(如 portproxy 轉發 , WSL2 Mirrored Mode)。
@@ -35,12 +35,14 @@ wsl-chrome-bridge 會：
 ## 使用環境需求
 - Windows 11 安裝最新版 chrome。
 - Windows 11 需要有 powershell.exe 可供 WSL2 執行。
-- Node 20+
+- WSL2 需要有 Node 20+
 
 
 ## 安裝與使用方式
 
 ### 安裝方式
+
+於 WSL 環境下用以下方式擇一安裝 :
 
 1. 透過 `npm install -g wsl-chrome-bridge` 安裝。
 2. 下載原始碼以 `npm link` 安裝。
@@ -120,7 +122,7 @@ command -v wsl-chrome-bridge
 
 #### 情境 B: 使用 mise 管理多版本 Node（建議做法）
 
-若你使用 mise 且可能切換多個 Node 版本，不建議把 `command -v` 找到的版本化路徑（例如 `.../installs/node/<version>/bin/...`）直接寫死在設定檔。
+若你使用 [mise](https://mise.jdx.dev/) 且可能切換多個 Node 版本，不建議把 `command -v` 找到的版本化路徑（例如 `.../installs/node/<version>/bin/...`）直接寫死在設定檔。
 
 建議改用 mise shim 固定入口：
 

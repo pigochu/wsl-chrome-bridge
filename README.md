@@ -8,7 +8,7 @@
 
 This project provides a CLI tool: `wsl-chrome-bridge`.
 
-From `chrome-devtools-mcp`'s perspective, `wsl-chrome-bridge` behaves like a Chrome executable.
+From [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp)'s perspective, `wsl-chrome-bridge` behaves like a Chrome executable.
 It provides a DevTools connection entry in WSL and bridges CDP messages to Windows Chrome.
 
 With the original `chrome-devtools-mcp` setup, you only need to change `--executablePath` and add a few bridge-specific arguments to let WSL agents control Windows Chrome, without system-level setup (for example `netsh interface portproxy` forwarding or WSL2 mirrored mode).
@@ -40,11 +40,13 @@ This idea came from [wsl-chrome-mcp](https://github.com/477174/wsl-chrome-mcp), 
 
 - Windows 11 with the latest Chrome installed
 - `powershell.exe` available for WSL2
-- Node 20+
+- WSL2 with Node 20+
 
 ## Install and Use
 
 ### Install
+
+In WSL, choose one of the following installation methods:
 
 1. Install globally with `npm install -g wsl-chrome-bridge`.
 2. Or clone source and install with `npm link`.
@@ -122,7 +124,7 @@ Then paste that output into `--executablePath`.
 
 #### Scenario B: Using mise for multiple Node versions (recommended)
 
-If you use mise and switch Node versions, do not hardcode a versioned path from `command -v` (for example `.../installs/node/<version>/bin/...`).
+If you use [mise](https://mise.jdx.dev/) and switch Node versions, do not hardcode a versioned path from `command -v` (for example `.../installs/node/<version>/bin/...`).
 
 Prefer the mise shim entry:
 
