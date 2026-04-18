@@ -1,115 +1,115 @@
 # Upgrade Guide: 0.1.0 -> 0.2.0
 
-本文件說明從 `wsl-chrome-bridge` `0.1.0` 升級到 `0.2.0` 需要調整的設定。
+This document describes the required and recommended changes when upgrading `wsl-chrome-bridge` from `0.1.0` to `0.2.0`.
 
-## 1. 必做變更
+## 1. Required Changes
 
-### 1.1 改用環境變數設定 debug log
+### 1.1 Use environment variable for debug log
 
-`0.2.0` 開始，以下舊寫法已棄用且會報錯：
+Starting in `0.2.0`, the legacy format below is deprecated and will fail:
 
 - `--chrome-arg=--bridge-debug-file=/tmp/xxx.log`
 
-請改為 MCP `env`：
+Use MCP `env` instead:
 
 ```toml
 WSL_CHROME_BRIDGE_DEBUG_FILE = "/tmp/debug-bridge.log"
 ```
 
-### 1.2 改用環境變數設定 Chrome 執行檔路徑
+### 1.2 Use environment variable for Chrome executable path
 
-`0.2.0` 開始，以下舊寫法已棄用且會報錯：
+Starting in `0.2.0`, the legacy format below is deprecated and will fail:
 
 ```text
 --bridge-chrome-executablePath=C:\Custom\Chrome\chrome.exe
 ```
 
-若你是透過 `chrome-devtools-mcp` 包一層傳入，常見會是：
+If you pass it through `chrome-devtools-mcp`, this is a common old form:
 
 ```text
 --chrome-arg=--bridge-chrome-executablePath=C:\Custom\Chrome\chrome.exe
 ```
 
-請改為 MCP `env`：
+Use MCP `env` instead:
 
 ```toml
 WSL_CHROME_BRIDGE_EXECUTABLE_PATH = "C:\\Custom\\Chrome\\chrome.exe"
 ```
 
-### 1.3 正式支援 `--user-data-dir`，並新增建議環境變數
+### 1.3 Official `--user-data-dir` support and new recommended env
 
-`0.2.0` 會只把「Windows 風格」路徑帶給 Windows Chrome。  
-像 `/cwd/%TEMP%\\...` 這種被 resolve 過的形式會嘗試還原回 Windows 路徑。
+In `0.2.0`, only Windows-style paths are forwarded to Windows Chrome.
+Resolved forms such as `/cwd/%TEMP%\\...` will be normalized back to a Windows path when possible.
 
-另外，Playwright 可能先建立本地端目錄（Linux 路徑）再交給 bridge。  
-bridge 現在會檢查該路徑，若是空目錄就安全刪除；非空目錄則保留。  
-`chrome-devtools-mcp` 一般不會有這個空目錄副作用。
+Also, Playwright may create a local Linux-path directory first and then pass it to bridge.
+Bridge now checks that path and safely removes it only when it is empty; non-empty directories are kept.
+`chrome-devtools-mcp` usually does not have this empty-directory side effect.
 
-因此，雖然 `--user-data-dir` 仍可用，仍建議優先在 MCP `env` 設定：
+So while `--user-data-dir` is still supported, the recommended approach is MCP `env`:
 
 ```toml
 WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx"
 ```
 
-`--user-data-dir` 仍可使用，但建議作為次要方式，並以 `WSL_CHROME_BRIDGE_USER_DATA_DIR` 統一兩種 MCP 的設定風格。
+`--user-data-dir` still works, but using `WSL_CHROME_BRIDGE_USER_DATA_DIR` is recommended to keep a unified configuration style across both MCPs.
 
-若你原本使用舊寫法：
+If you previously used:
 
 ```text
 --chrome-arg=--user-data-dir=%TEMP%\wsl-chrome-bridge\chrome-profile-xxx
 ```
 
-升級到 `0.2.0` 建議改成上方 `WSL_CHROME_BRIDGE_USER_DATA_DIR`。
+After upgrading to `0.2.0`, migrate to the `WSL_CHROME_BRIDGE_USER_DATA_DIR` approach above.
 
-## 2. 建議變更
+## 2. Recommended Changes
 
-### 2.1 以環境變數指定固定 debug port（可選）
+### 2.1 Optional fixed debug port via environment variable
 
-若你需要固定 port（例如防火牆、除錯工具綁定），可設定：
+If you need a fixed port (for example firewall rules or debugging tools), set:
 
 ```toml
 WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT = "9222"
 ```
 
-若你原本使用舊寫法：
+If you previously used:
 
 ```text
 --chrome-arg=--bridge-remote-debugging-port=9222
 ```
 
-升級到 `0.2.0` 建議改成 MCP `env` 的 `WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT`。  
-建議統一用環境變數管理，避免不同 MCP 設定方式造成混用。
+In `0.2.0`, migrate to MCP `env` using `WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT`.
+Using environment variables is recommended to avoid mixed styles between different MCP setups.
 
-若未指定，`0.2.0` 預設改為「隨機可用 port」，不再固定 `9222`。
+If not specified, `0.2.0` now defaults to a random available port instead of fixed `9222`.
 
-### 2.2 chrome-devtools 與 playwright 請用不同 profile（可選但強烈建議）
+### 2.2 Use different profiles for chrome-devtools and playwright (optional but strongly recommended)
 
-若兩者共用同一個 profile（不論是 `--user-data-dir` 或 `WSL_CHROME_BRIDGE_USER_DATA_DIR`），可能互相影響同一個 Windows Chrome 實例。  
-建議各自指定不同 profile 目錄。
+If both tools share the same profile (via either `--user-data-dir` or `WSL_CHROME_BRIDGE_USER_DATA_DIR`), they may interfere with the same Windows Chrome instance.
+Use separate profile directories for each MCP.
 
-### 2.3 Playwright 建議加上 `--browser chrome`
+### 2.3 For Playwright, add `--browser chrome`
 
-在 bridge + Windows Chrome 情境下，`playwright-mcp` 若未明確指定 browser channel，可能出現上游傳入 `--no-sandbox`，並在 Chrome 顯示警告列。
+In bridge + Windows Chrome scenarios, `playwright-mcp` without an explicit browser channel may send `--no-sandbox`, which can show a warning banner in Chrome.
 
-建議於 Playwright MCP args 額外加入：
+Add this in Playwright MCP args:
 
 ```text
 --browser chrome
 ```
 
-這是設定層級的建議，不影響 bridge 功能，但可避免常見的 `--no-sandbox` UI 警告。
+This is a configuration recommendation and does not change bridge core behavior, but it avoids the common `--no-sandbox` UI warning.
 
-## 3. 驗證清單
+## 3. Verification Checklist
 
-升級後可用以下方式快速驗證：
+After upgrading, use this quick checklist:
 
-1. 啟動 `chrome-devtools-mcp`，確認 bridge 可正常開頁。
-2. 啟動 `playwright-mcp`，確認可正常導頁（例如 `https://www.google.com`）。
-3. 檢查 debug log（`WSL_CHROME_BRIDGE_DEBUG_FILE`）：
-   - 有 `launchPlan` / `windowsArgs` 記錄
-   - `windowsUserDataDir` 或 `windowsArgs` 中的 `--user-data-dir` 為預期 Windows 路徑
+1. Start `chrome-devtools-mcp` and verify bridge can open pages.
+2. Start `playwright-mcp` and verify navigation works (for example `https://www.google.com`).
+3. Check debug log (`WSL_CHROME_BRIDGE_DEBUG_FILE`):
+   - Contains `launchPlan` / `windowsArgs`
+   - `windowsUserDataDir` or `--user-data-dir` inside `windowsArgs` matches your expected Windows path
 
-## 4. 範例（MCP env）
+## 4. Example (MCP env)
 
 ```toml
 env = {
@@ -119,4 +119,4 @@ env = {
 }
 ```
 
-`WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT` 可省略；省略時 bridge 會自動使用隨機可用 port。
+`WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT` is optional; when omitted, bridge uses a random available port.

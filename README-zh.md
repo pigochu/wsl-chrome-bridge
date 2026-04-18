@@ -13,7 +13,7 @@
 
 `0.2.0` 新增對 `playwright-mcp` 的支援，並且調整多項 bridge 參數行為與設定方式。
 
-若你是從 `0.1.0` 升級，請先閱讀升級說明文件：[UPGRADE.md](./UPGRADE.md)。
+若你是從 `0.1.0` 升級，請先閱讀升級說明文件：[UPGRADE-zh.md](./UPGRADE-zh.md)。
 
 ## 基本運作方式
 
