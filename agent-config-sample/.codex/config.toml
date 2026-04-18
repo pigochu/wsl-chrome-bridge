@@ -15,8 +15,57 @@ args = [
     "--chrome-arg=--window-size=720,400",
     "--chrome-arg=--new-window",
     "--chrome-arg=--lang=zh-TW",
-    "--chrome-arg=--bridge-remote-debugging-port=9222",
-    "--chrome-arg=--bridge-debug-file=/tmp/wsl-chrome-bridge-debug.log",
     "--no-sandbox"
 ]
 enabled = true
+
+[mcp_servers.chrome-devtools.env]
+# Recommended: set profile path through bridge env to avoid
+# user-data-dir behavior differences between MCP implementations.
+WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-chrome-devtools"
+
+# Optional: override Windows Chrome executable path.
+# Use this only when Chrome is installed in a non-default location.
+# WSL_CHROME_BRIDGE_EXECUTABLE_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+
+# Optional: bridge debug log file.
+# Usually you do NOT need this. Enable it only when reproducing a bug
+# and you want to provide logs to the project maintainer.
+# WSL_CHROME_BRIDGE_DEBUG_FILE = "/tmp/debug-chrome-devtools.log"
+
+[mcp_servers.playwright]
+command = "npx"
+args = [
+    "-y",
+    "@playwright/mcp@latest",
+    # Recommended when bridging to system Chrome:
+    # keeps Chromium sandbox enabled and avoids upstream --no-sandbox warning banner.
+    "--browser",
+    "chrome",
+    "--sandbox",
+    "--executable-path",
+    "<REPLACE_WITH_ABSOLUTE_PATH_TO_WSL_CHROME_BRIDGE>"
+]
+enabled = true
+
+[mcp_servers.playwright.env]
+# Recommended: set profile path through bridge env to avoid
+# Playwright pre-creating local Linux artifact directories.
+WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-playwright"
+
+# Optional: override Windows Chrome executable path.
+# Use this only when Chrome is installed in a non-default location.
+# WSL_CHROME_BRIDGE_EXECUTABLE_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+
+# Optional: bridge debug log file.
+# Usually you do NOT need this. Enable it only when reproducing a bug
+# and you want to provide logs to the project maintainer.
+# WSL_CHROME_BRIDGE_DEBUG_FILE = "/tmp/debug-playwright.log"
+
+# Optional: force a fixed Windows Chrome remote-debugging port.
+# Most users should keep this commented so bridge can auto-pick a free port.
+# WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT = "9222"
+
+# Keep DISPLAY enabled for Playwright in WSL so it does not auto-fallback
+# to headless mode due to missing display environment.
+DISPLAY = ":9999"

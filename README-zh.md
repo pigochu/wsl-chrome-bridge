@@ -9,26 +9,32 @@
 
 此構想是看到 [wsl-chrome-mcp](https://github.com/477174/wsl-chrome-mcp) 實作方式是利用 `powershell` 繞過限制，但由於此專案是以 MCP Server 方式提供服務，但我想繼續使用比較多人維護的 `chrome-devtools-mcp`，所以才寫了本專案作為橋接手段。
 
+## 0.2.0 重大變更（支援 Playwright）
+
+`0.2.0` 新增對 `playwright-mcp` 的支援，並且調整多項 bridge 參數行為與設定方式。
+
+若你是從 `0.1.0` 升級，請先閱讀升級說明文件：[UPGRADE.md](./UPGRADE.md)。
 
 ## 基本運作方式
 
 ```text
-[chrome-devtools-mcp]
-       |
-    stdio pipe
-       |
-[wsl-chrome-bridge]
-       |
- PowerShell websocket relay
-       |
-[Windows Chrome]
+[Chrome DevTools MCP]             [Playwright MCP]
+         |                              |
+      stdio pipe                remote-debugging-port
+         |                              |
+         +------[wsl-chrome-bridge]-----+
+                         |
+            PowerShell websocket relay
+                         |
+                 [Windows Chrome]
 ```
 
 wsl-chrome-bridge 會：
 
-- 接收 `chrome-devtools-mcp` 傳入的 Chrome 啟動參數
+- 接收 `chrome-devtools-mcp` 與 `playwright-mcp` 傳入的 Chrome 啟動參數
 - 啟動 Windows Chrome（透過PowerShell）
-- 以 stdio pipe（OS pipe）接收/回傳 CDP 訊息
+- 在 `chrome-devtools-mcp` 模式下，透過 stdio pipe（OS pipe）接收/回傳 CDP 訊息
+- 在 `playwright-mcp` 模式下，於本機建立對應 port 的 WebSocket proxy 後轉發 CDP 訊息
 - 透過 PowerShell WebSocket relay 雙向轉發 CDP 訊息到 Windows Chrome
 
 
@@ -45,12 +51,22 @@ wsl-chrome-bridge 會：
 於 WSL 環境下用以下方式擇一安裝 :
 
 1. 透過 `npm install -g wsl-chrome-bridge` 安裝。
-2. 下載原始碼以 `npm link` 安裝。
+2. 下載原始碼後自行編譯，再以 `npm link` 安裝：
+
+```bash
+git clone https://github.com/pigochu/wsl-chrome-bridge.git
+cd wsl-chrome-bridge
+npm install
+npm run build
+npm link
+```
 
 ### 使用方式 (以 codex 為例子)
 
 1. 找出 wsl-chrome-bridge 實際位置 , 假設是 `/home/pigochu/.local/share/mise/shims/wsl-chrome-bridge`。
-2. 設定檔撰寫，如以下範例 `.codex/config.toml`
+2. 設定檔撰寫，如以下範例 `.codex/config.toml`。
+
+`chrome-devtools-mcp` 最小可運作設定：
 
 ```toml
 [sandbox_workspace_write]
@@ -62,20 +78,41 @@ args = [
     "-y",
     "chrome-devtools-mcp@latest",
     "--executablePath",
-    "/home/pigochu/.local/share/mise/shims/wsl-chrome-bridge",
-    "--chrome-arg=--window-size=720,400",
-    "--chrome-arg=--new-window",
-    "--chrome-arg=--user-data-dir=%TEMP%\\wsl-chrome-bridge\\chrome-profile-test",
-    "--chrome-arg=--bridge-remote-debugging-port=9222",
-    "--no-sandbox"
+    "/home/pigochu/.local/share/mise/shims/wsl-chrome-bridge"
 ]
 enabled = true
 ```
 
-此範例會於 Windows 開啟 Chrome 時指定 port 9222 供 `wsl-chrome-bridge` 連接並與 `chrome-devtools-mcp` 互相收發資料。
+這是最小可運作設定。`wsl-chrome-bridge` 會啟動 Windows Chrome，並為 `chrome-devtools-mcp` 橋接 CDP 流量，不需要額外 bridge 專用參數。
+
+`playwright-mcp` 最小可運作設定（含 sandbox）：
+
+```toml
+[sandbox_workspace_write]
+network_access = true
+
+[mcp_servers.playwright]
+command = "npx"
+args = [
+    "-y",
+    "@playwright/mcp@latest",
+    "--browser",
+    "chrome",
+    "--sandbox",
+    "--executable-path",
+    "/home/pigochu/.local/share/mise/shims/wsl-chrome-bridge"
+]
+enabled = true
+
+[mcp_servers.playwright.env]
+DISPLAY = ":9999"
+```
+
+在 bridge + Windows 系統 Chrome 的情境下，加上 `--browser chrome` 可避免常見的上游 `--no-sandbox` 警告行為，並維持 Playwright 啟動行為穩定。
 
 > [!NOTE]
 > FAQ 章節有介紹 `--executablePath` 的路徑尋找的方式。
+> 其他設定寫法可參考 `agent-config-sample/.codex/`。
 
 
 ## 開發時所用的技術棧
@@ -142,27 +179,67 @@ ls -la ~/.local/share/mise/shims/wsl-chrome-bridge
 - 不使用版本管理工具時，透過 `command -v` 找絕對路徑是可行且直接的方法。
 - 使用 mise 多版本 Node 時，建議使用 `/home/<user>/.local/share/mise/shims/wsl-chrome-bridge`，避免 Node 版本切換後路徑失效。
 
+### 為什麼 Playwright 需要設定 `DISPLAY`
 
-### `--user-data-dir` 為何不建議用
+在 WSL/Linux 環境下，`playwright-mcp` 啟動瀏覽器時會先判斷圖形顯示環境。  
+若 `DISPLAY` 沒有設定，Playwright 通常會改成 headless 行為（即使你沒有手動指定 `--headless`）。
 
-因為 `chrome-devtools-mcp` 的實作方式會判斷 --user-data-dir 的路徑是否為絕對路徑 (以 '/' 開頭)，如果不是絕對路徑，會以相對路徑串接，因此就無法使用 `%TEMP%\\...` 這種方式提供，必須改用 `--chrome-arg=--user-data-dir=...` 作為 Chrome 啟動參數。
+而這個判斷是在 bridge 之前就完成，所以 `wsl-chrome-bridge` 無法在後段覆蓋該決策。  
+如果你希望在 Windows 看到實際 Chrome 視窗，請於 MCP `env` 額外設定 `DISPLAY`（例如 `DISPLAY=:999`）。
+
+### 為什麼 Playwright 可能出現 `--no-sandbox` 警告
+
+`playwright-mcp` 若未明確指定 browser channel，可能會產生含 `--no-sandbox` 的啟動參數。  
+在有視窗的 Chrome 中，會看到這類警告列：
+`你正在使用不受支援的命令列標幟: --no-sandbox`
+
+建議在 Playwright MCP args 明確加入：
+
+```text
+--browser chrome
+```
+
+這樣在常見 bridge 設定下可避免上游傳入 `--no-sandbox`。
+
+
+### `--user-data-dir` 說明
+
+`wsl-chrome-bridge` 現在支援上游 MCP 直接傳入 `--user-data-dir` / `--userDataDir`。
+
+Playwright 可能會把原本的 Windows 風格路徑先 resolve 成 Linux 路徑，並在本地先建立一個空目錄再交給 bridge。  
+bridge 目前會檢查該路徑，且僅在「空目錄」時才會安全刪除；非空目錄不會刪除。
+
+`chrome-devtools-mcp` 一般不會有這個本地空目錄副作用。
+
+另外，bridge 只會把「Windows 風格」的 user-data-dir 傳給 Windows Chrome。像 `/cwd/%TEMP%\\...` 這種被 resolve 過的形式會先嘗試還原。
+
+為了避免 Playwright 差異，並統一 `chrome-devtools-mcp` / `playwright-mcp` 的設定風格，建議優先使用：
+
+```toml
+WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx"
+```
+
+`--user-data-dir` 仍可使用，但建議把 `WSL_CHROME_BRIDGE_USER_DATA_DIR` 當成預設寫法。
 
 
 ## 設定參數重要說明
 
-- `--user-data-dir` : 原 `chrome-devtools-mcp` 提供用於設定 Chrome Profile 路徑，但 `chrome-devtools-mcp` 可能會傳入非預期的路徑，**請勿使用**。
-- `--chrome-arg=--user-data-dir=...` : 用於設定 Chrome Profile 路徑。
-- `--chrome-arg=--bridge-chrome-executablePath=...` : 用於指定 Chrome 的執行檔絕對路徑，這是可選參數，若用戶有自行安裝到特殊目錄才需使用，路徑必須符合 Windows 格式，如 `C:\\....`。
-- `--chrome-arg=--bridge-remote-debugging-port=9222` : 用於設定 Chrome 開啟時提供的遠端連線 port，這是可選參數，若不指定，預設會是 9222，此參數為本程式額外 hack 的，並不是真的 Chrome 參數。
-- `--chrome-arg=--bridge-debug-file=/tmp/xxx.log` : 用於 debug 用，會將 debug 訊息寫入指定的 WSL 環境下的檔案，可選參數。
+- `--user-data-dir` / `--userDataDir` : 僅當最終值為 Windows 風格（包含 `%TEMP%\\...` 還原成功）才會帶入啟動參數。
+- `playwright-mcp --browser chrome` : 建議搭配 bridge 使用，可避免上游送出 `--no-sandbox` 警告列。
+
+## 環境變數重要說明
+
+- `WSL_CHROME_BRIDGE_USER_DATA_DIR=%TEMP%\\...` : 建議預設使用。可固定指定 Windows Chrome profile 路徑，且優先於上游 `--user-data-dir`，可避開 Playwright 本地空目錄副作用，並統一兩種 MCP 設定風格。
+- `WSL_CHROME_BRIDGE_EXECUTABLE_PATH=C:\\...` : 可選環境變數，用於覆蓋 Windows Chrome 的執行檔路徑。
+- `WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT=9222` : 以環境變數指定 Windows Chrome debug port。若都沒指定，bridge 改為隨機 port，不再固定 9222。
+- bridge 會在 Windows 端先探測 port 可用性。若是固定 port 模式且該 port 已被占用，會在啟動前直接報錯。
+- `WSL_CHROME_BRIDGE_DEBUG_FILE=/tmp/xxx.log` : 以環境變數指定 bridge debug log 輸出路徑。
 
 ### 已確認無法使用的參數
 
-以下列表為搭配本程式確定無法使用 `chrome-devtools-mcp` 原始的參數
+以下列表為搭配本程式確定無法使用 `chrome-devtools-mcp` 原始參數
 
-- `--user-data-dir` : 因 `chrome-devtools-mcp` 內部目前寫法可能會將預期的 Windows 路徑格式轉成 Linux 路徑格式，所以會被本程式過濾掉而無作用，因此不建議使用此參數來設定 Chrome Profile Path。
-- `--browser-url` : 這是遠端連線的設定，如果設定此參數，會變成 `chrome-devtools-mcp` 走遠端連線模式而非 Pipe，這樣就無法與 `wsl-chrome-bridge` 連線，須改用 `--chrome-arg=--bridge-remote-debugging-port...`。
+- `--browser-url` : 這是遠端連線設定，一旦啟用就會讓 `chrome-devtools-mcp` 走 remote mode 而非 pipe mode，無法與 `wsl-chrome-bridge` 配合。
 
 
 > 其他 `chrome-devtools-mcp` 提供的原始參數未必全部能使用，本程式尚在開發中，也沒有完全測試過所有原始參數，故只列出目前已經測試過的。
-

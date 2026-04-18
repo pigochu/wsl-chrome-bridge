@@ -17,8 +17,13 @@ describe("planBridgeLaunch", () => {
     );
 
     expect(plan.requestedLocalDebugPort).toBe(9222);
+    expect(plan.localProxyPort).toBe(9222);
+    expect(plan.usePipeTransport).toBe(false);
     expect(plan.userDataDir).toBe("%TEMP%\\wsl-chrome-bridge-profile");
+    expect(plan.windowsUserDataDir).toBe("%TEMP%\\wsl-chrome-bridge-profile");
+    expect(plan.windowsUserDataDirSource).toBe("arg");
     expect(plan.windowsDebugPort).toBe(9222);
+    expect(plan.windowsDebugPortSource).toBe("upstream-port");
     expect(plan.passthroughArgs).toContain("--no-first-run");
     expect(plan.passthroughArgs.find((x) => x.startsWith("--remote-debugging-port"))).toBeUndefined();
   });
@@ -29,10 +34,19 @@ describe("planBridgeLaunch", () => {
     );
   });
 
+  it("marks pipe transport when remote-debugging-pipe is requested", () => {
+    const plan = planBridgeLaunch(["--remote-debugging-pipe", "--disable-gpu"]);
+    expect(plan.usePipeTransport).toBe(true);
+    expect(plan.passthroughArgs).toContain("--disable-gpu");
+    expect(plan.passthroughArgs).not.toContain("--remote-debugging-pipe");
+  });
+
   it("respects user-defined remote debugging port", () => {
     const plan = planBridgeLaunch(["--remote-debugging-port=14444"]);
     expect(plan.requestedLocalDebugPort).toBe(14444);
+    expect(plan.localProxyPort).toBe(14444);
     expect(plan.windowsDebugPort).toBe(14444);
+    expect(plan.windowsDebugPortSource).toBe("upstream-port");
   });
 
   it("prefers bridge remote debugging port over remote-debugging-port", () => {
@@ -42,7 +56,9 @@ describe("planBridgeLaunch", () => {
     ]);
 
     expect(plan.requestedLocalDebugPort).toBe(14444);
+    expect(plan.localProxyPort).toBe(14444);
     expect(plan.windowsDebugPort).toBe(9222);
+    expect(plan.windowsDebugPortSource).toBe("bridge-arg");
     expect(
       plan.passthroughArgs.find((x) => x.startsWith("--bridge-remote-debugging-port"))
     ).toBeUndefined();
@@ -56,6 +72,7 @@ describe("planBridgeLaunch", () => {
     ]);
 
     expect(plan.windowsDebugPort).toBe(9333);
+    expect(plan.windowsDebugPortSource).toBe("bridge-arg");
     expect(plan.passthroughArgs).toContain("--disable-gpu");
   });
 
@@ -65,48 +82,120 @@ describe("planBridgeLaunch", () => {
     );
   });
 
-  it("defaults remote debugging port to 9222 when not specified", () => {
+  it("uses random Windows debug port when no debug port is specified", () => {
     const plan = planBridgeLaunch(["--disable-gpu"]);
-    expect(plan.requestedLocalDebugPort).toBe(9222);
-    expect(plan.windowsDebugPort).toBe(9222);
+    expect(plan.requestedLocalDebugPort).toBeNull();
+    expect(plan.localProxyPort).toBeNull();
+    expect(plan.userDataDir).toBeNull();
+    expect(plan.windowsUserDataDir).toBeNull();
+    expect(plan.windowsUserDataDirSource).toBe("none");
+    expect(plan.createdUserDataDir).toBe(false);
+    expect(plan.windowsDebugPortSource).toBe("auto-random");
+    expect(plan.windowsDebugPort).toBeGreaterThanOrEqual(10000);
+    expect(plan.windowsDebugPort).toBeLessThanOrEqual(65535);
   });
 
-  it("captures bridge-only debug file and removes it from passthrough args", () => {
-    const plan = planBridgeLaunch(
-      ["--bridge-debug-file=/tmp/wsl-chrome-bridge-debug.log", "--disable-gpu"]
-    );
-
-    expect(plan.bridgeDebugFile).toBe("/tmp/wsl-chrome-bridge-debug.log");
-    expect(plan.passthroughArgs).toContain("--disable-gpu");
-    expect(plan.passthroughArgs.find((x) => x.startsWith("--bridge-debug-file"))).toBeUndefined();
+  it("uses WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT when no explicit bridge port is provided", () => {
+    const plan = planBridgeLaunch(["--disable-gpu"], {
+      WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT: "9333"
+    });
+    expect(plan.windowsDebugPort).toBe(9333);
+    expect(plan.windowsDebugPortSource).toBe("env");
   });
 
-  it("captures bridge-only chrome executable path and removes it from passthrough args", () => {
+  it("prefers bridge remote debugging port over WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT", () => {
     const plan = planBridgeLaunch(
-      [
-        "--bridge-chrome-executablePath=C:\\Custom\\Chrome\\chrome.exe",
-        "--disable-gpu"
-      ]
+      ["--bridge-remote-debugging-port=9444"],
+      { WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT: "9333" }
     );
+    expect(plan.windowsDebugPort).toBe(9444);
+    expect(plan.windowsDebugPortSource).toBe("bridge-arg");
+  });
+
+  it("rejects invalid WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT values", () => {
+    expect(() =>
+      planBridgeLaunch(["--disable-gpu"], { WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT: "0" })
+    ).toThrow(/invalid WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT/);
+  });
+
+  it("rejects deprecated --bridge-debug-file flag", () => {
+    expect(() => planBridgeLaunch(["--bridge-debug-file=/tmp/old.log"])).toThrow(
+      /--bridge-debug-file is deprecated/
+    );
+  });
+
+  it("uses WSL_CHROME_BRIDGE_DEBUG_FILE when bridge-debug-file arg is not provided", () => {
+    const plan = planBridgeLaunch(
+      ["--disable-gpu"],
+      { WSL_CHROME_BRIDGE_DEBUG_FILE: "/tmp/env-debug.log" }
+    );
+
+    expect(plan.bridgeDebugFile).toBe("/tmp/env-debug.log");
+  });
+
+  it("ignores empty WSL_CHROME_BRIDGE_DEBUG_FILE values", () => {
+    const plan = planBridgeLaunch(
+      ["--disable-gpu"],
+      { WSL_CHROME_BRIDGE_DEBUG_FILE: "   " }
+    );
+
+    expect(plan.bridgeDebugFile).toBeNull();
+  });
+
+  it("rejects deprecated --bridge-chrome-executablePath flag", () => {
+    expect(() =>
+      planBridgeLaunch(["--bridge-chrome-executablePath=C:\\Custom\\Chrome\\chrome.exe"])
+    ).toThrow(/--bridge-chrome-executablePath is deprecated/);
+  });
+
+  it("rejects deprecated --bridge-chrome-executable-path flag", () => {
+    expect(() =>
+      planBridgeLaunch(["--bridge-chrome-executable-path", "C:\\Another Chrome\\chrome.exe"])
+    ).toThrow(/--bridge-chrome-executable-path is deprecated/);
+  });
+
+  it("uses WSL_CHROME_BRIDGE_EXECUTABLE_PATH when provided", () => {
+    const plan = planBridgeLaunch(["--disable-gpu"], {
+      WSL_CHROME_BRIDGE_EXECUTABLE_PATH: "C:\\Custom\\Chrome\\chrome.exe"
+    });
 
     expect(plan.bridgeChromeExecutablePath).toBe("C:\\Custom\\Chrome\\chrome.exe");
     expect(plan.passthroughArgs).toContain("--disable-gpu");
-    expect(
-      plan.passthroughArgs.find((x) => x.startsWith("--bridge-chrome-executablePath"))
-    ).toBeUndefined();
   });
 
-  it("accepts separated bridge chrome executable arg form", () => {
+  it("uses WSL_CHROME_BRIDGE_USER_DATA_DIR when provided", () => {
+    const plan = planBridgeLaunch(["--disable-gpu"], {
+      WSL_CHROME_BRIDGE_USER_DATA_DIR: "%TEMP%\\wsl-chrome-bridge\\chrome-profile-env"
+    });
+
+    expect(plan.userDataDir).toBeNull();
+    expect(plan.windowsUserDataDir).toBe("%TEMP%\\wsl-chrome-bridge\\chrome-profile-env");
+    expect(plan.windowsUserDataDirSource).toBe("env");
+  });
+
+  it("prefers WSL_CHROME_BRIDGE_USER_DATA_DIR over --user-data-dir", () => {
     const plan = planBridgeLaunch(
-      [
-        "--bridge-chrome-executablePath",
-        "C:\\Another Chrome\\chrome.exe",
-        "--disable-gpu"
-      ]
+      ["--user-data-dir=%TEMP%\\wsl-chrome-bridge\\chrome-profile-arg"],
+      { WSL_CHROME_BRIDGE_USER_DATA_DIR: "%TEMP%\\wsl-chrome-bridge\\chrome-profile-env" }
     );
 
-    expect(plan.bridgeChromeExecutablePath).toBe("C:\\Another Chrome\\chrome.exe");
-    expect(plan.passthroughArgs).toContain("--disable-gpu");
+    expect(plan.userDataDir).toBe("%TEMP%\\wsl-chrome-bridge\\chrome-profile-arg");
+    expect(plan.windowsUserDataDir).toBe("%TEMP%\\wsl-chrome-bridge\\chrome-profile-env");
+    expect(plan.windowsUserDataDirSource).toBe("env");
+  });
+
+  it("rejects invalid WSL_CHROME_BRIDGE_USER_DATA_DIR values", () => {
+    expect(() =>
+      planBridgeLaunch(["--disable-gpu"], { WSL_CHROME_BRIDGE_USER_DATA_DIR: "/tmp/not-windows" })
+    ).toThrow(/invalid WSL_CHROME_BRIDGE_USER_DATA_DIR/);
+  });
+
+  it("ignores empty WSL_CHROME_BRIDGE_EXECUTABLE_PATH values", () => {
+    const plan = planBridgeLaunch(["--disable-gpu"], {
+      WSL_CHROME_BRIDGE_EXECUTABLE_PATH: "   "
+    });
+
+    expect(plan.bridgeChromeExecutablePath).toBeNull();
   });
 
   it("accepts camelCase --userDataDir and does not auto-create extra profile dir", () => {
@@ -115,49 +204,114 @@ describe("planBridgeLaunch", () => {
     expect(plan.createdUserDataDir).toBe(false);
     expect(plan.userDataDir).toBe("%TEMP%\\wsl-chrome-bridge-profile");
     expect(plan.windowsUserDataDir).toBe("%TEMP%\\wsl-chrome-bridge-profile");
+    expect(plan.windowsUserDataDirSource).toBe("arg");
   });
 
-  it("ignores linux-style --user-data-dir path and falls back to default windows profile", () => {
-    const plan = planBridgeLaunch(["--user-data-dir=/home/user/chrome-profile", "--disable-gpu"]);
+  it("does not use linux-style --user-data-dir for Windows Chrome launch", () => {
+    const plan = planBridgeLaunch(
+      ["--user-data-dir=/home/user/chrome-profile", "--disable-gpu"]
+    );
 
-    expect(plan.createdUserDataDir).toBe(true);
-    expect(plan.windowsUserDataDir).toBe("%TEMP%\\wsl-chrome-bridge\\chrome-profile");
+    expect(plan.createdUserDataDir).toBe(false);
+    expect(plan.userDataDir).toBe("/home/user/chrome-profile");
+    expect(plan.windowsUserDataDir).toBeNull();
+    expect(plan.windowsUserDataDirSource).toBe("none");
     expect(plan.passthroughArgs).toContain("--disable-gpu");
-    expect(plan.passthroughArgs).not.toContain("--user-data-dir=/home/user/chrome-profile");
   });
 
-  it("ignores linux-style --userDataDir path and falls back to default windows profile", () => {
-    const plan = planBridgeLaunch(["--userDataDir", "/tmp/chrome-profile", "--disable-gpu"]);
+  it("does not use linux-style --userDataDir for Windows Chrome launch", () => {
+    const plan = planBridgeLaunch(
+      ["--userDataDir", "/tmp/chrome-profile", "--disable-gpu"]
+    );
 
-    expect(plan.createdUserDataDir).toBe(true);
-    expect(plan.windowsUserDataDir).toBe("%TEMP%\\wsl-chrome-bridge\\chrome-profile");
+    expect(plan.createdUserDataDir).toBe(false);
+    expect(plan.userDataDir).toBe("/tmp/chrome-profile");
+    expect(plan.windowsUserDataDir).toBeNull();
+    expect(plan.windowsUserDataDirSource).toBe("none");
     expect(plan.passthroughArgs).toContain("--disable-gpu");
-    expect(plan.passthroughArgs).not.toContain("--userDataDir");
-    expect(plan.passthroughArgs).not.toContain("/tmp/chrome-profile");
   });
 
-  it("ignores chrome-devtools-mcp default linux cache profile path", () => {
+  it("does not use chrome-devtools-mcp default linux cache profile path", () => {
     const plan = planBridgeLaunch(
       ["--user-data-dir=/home/user/.cache/chrome-devtools-mcp/chrome-profile"]
     );
 
-    expect(plan.createdUserDataDir).toBe(true);
-    expect(plan.windowsUserDataDir).toBe("%TEMP%\\wsl-chrome-bridge\\chrome-profile");
+    expect(plan.createdUserDataDir).toBe(false);
+    expect(plan.userDataDir).toBe("/home/user/.cache/chrome-devtools-mcp/chrome-profile");
+    expect(plan.windowsUserDataDir).toBeNull();
+    expect(plan.windowsUserDataDirSource).toBe("none");
+  });
+
+  it("restores path-resolved %TEMP% windows path from linux absolute prefix", () => {
+    const plan = planBridgeLaunch(["--user-data-dir=/work/%TEMP%\\abc\\def"]);
+    expect(plan.createdUserDataDir).toBe(false);
+    expect(plan.windowsUserDataDir).toBe("%TEMP%\\abc\\def");
+    expect(plan.windowsUserDataDirSource).toBe("arg");
+  });
+
+  it("restores path-resolved root-style windows path from linux absolute prefix", () => {
+    const plan = planBridgeLaunch([`--user-data-dir=${String.raw`/work/\abc\def`}`]);
+    expect(plan.createdUserDataDir).toBe(false);
+    expect(plan.windowsUserDataDir).toBe(String.raw`\abc\def`);
+    expect(plan.windowsUserDataDirSource).toBe("arg");
+  });
+
+  it("restores path-resolved drive windows path from linux absolute prefix", () => {
+    const plan = planBridgeLaunch(["--user-data-dir=/work/c:\\abc\\def"]);
+    expect(plan.createdUserDataDir).toBe(false);
+    expect(plan.windowsUserDataDir).toBe("c:\\abc\\def");
+    expect(plan.windowsUserDataDirSource).toBe("arg");
   });
 });
 
 describe("buildWindowsChromeArgs", () => {
   it("injects windows debug flags and preserves configured user-data-dir", () => {
-    const plan = planBridgeLaunch(["--user-data-dir=%TEMP%\\foo"]);
+    const plan = planBridgeLaunch([
+      "--user-data-dir=%TEMP%\\foo",
+      "--remote-debugging-port=24444"
+    ]);
 
     const windowsArgs = buildWindowsChromeArgs(plan, {
       WSL_DISTRO_NAME: "Ubuntu"
     });
 
     expect(windowsArgs).toContain("--user-data-dir=%TEMP%\\foo");
-    expect(windowsArgs).toContain("--remote-debugging-port=9222");
+    expect(windowsArgs).toContain("--remote-debugging-port=24444");
     expect(windowsArgs).toContain("--remote-debugging-address=127.0.0.1");
     expect(windowsArgs).toContain("--remote-allow-origins=*");
+  });
+
+  it("does not inject user-data-dir when resolved path is still linux-style", () => {
+    const plan = planBridgeLaunch([
+      "--user-data-dir=/home/user/chrome-profile",
+      "--remote-debugging-port=24444"
+    ]);
+
+    const windowsArgs = buildWindowsChromeArgs(plan, {
+      WSL_DISTRO_NAME: "Ubuntu"
+    });
+
+    expect(windowsArgs.find((x) => x.startsWith("--user-data-dir="))).toBeUndefined();
+    expect(windowsArgs).toContain("--remote-debugging-port=24444");
+  });
+
+  it("injects env user-data-dir even when upstream sends linux-style path", () => {
+    const plan = planBridgeLaunch(
+      [
+        "--user-data-dir=/home/user/chrome-profile",
+        "--remote-debugging-port=24444"
+      ],
+      {
+        WSL_CHROME_BRIDGE_USER_DATA_DIR: "%TEMP%\\wsl-chrome-bridge\\chrome-profile-env"
+      }
+    );
+
+    const windowsArgs = buildWindowsChromeArgs(plan, {
+      WSL_DISTRO_NAME: "Ubuntu"
+    });
+
+    expect(windowsArgs).toContain("--user-data-dir=%TEMP%\\wsl-chrome-bridge\\chrome-profile-env");
+    expect(windowsArgs).toContain("--remote-debugging-port=24444");
   });
 });
 

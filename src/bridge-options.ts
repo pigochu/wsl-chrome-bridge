@@ -1,17 +1,31 @@
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { normalizeChromeArgs } from "./arg-normalizer.js";
 
 export interface BridgeLaunchPlan {
+  /** Raw arguments received from the upstream MCP process. */
   originalArgs: string[];
+  /** Arguments that should continue through normalization and Windows launch. */
   passthroughArgs: string[];
+  /** Whether upstream explicitly requested Chrome DevTools pipe transport. */
+  usePipeTransport: boolean;
+  /** Optional bridge debug log file path in WSL. */
   bridgeDebugFile: string | null;
+  /** Optional Chrome executable override from environment variable. */
   bridgeChromeExecutablePath: string | null;
-  userDataDir: string;
-  windowsUserDataDir: string;
-  requestedLocalDebugPort: number;
+  /** User-data-dir value as seen by the bridge (WSL side). */
+  userDataDir: string | null;
+  /** User-data-dir value rewritten for Windows Chrome. */
+  windowsUserDataDir: string | null;
+  /** Source of the Windows user-data-dir decision. */
+  windowsUserDataDirSource: "arg" | "env" | "none";
+  /** Local proxy port requested by upstream (for example Playwright's random port). */
+  requestedLocalDebugPort: number | null;
+  /** Local websocket proxy port exposed by the bridge in WSL. */
+  localProxyPort: number | null;
+  /** Remote debugging port used to launch Windows Chrome. */
   windowsDebugPort: number;
+  /** Source of the Windows debugging port decision. */
+  windowsDebugPortSource: "bridge-arg" | "env" | "upstream-port" | "auto-random";
+  /** Whether bridge created a temporary WSL profile directory and must clean it up. */
   createdUserDataDir: boolean;
 }
 
@@ -23,12 +37,17 @@ const BRIDGE_REMOTE_DEBUGGING_PORT_FLAGS = [
   "--bridge-remote-debugging-port",
   "--bridge-remote-debuggingPort"
 ];
-const DEFAULT_WINDOWS_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile";
+const LOCAL_REMOTE_DEBUGGING_PORT_FLAGS = [
+  "--remote-debugging-port",
+  "--remote-debug-port"
+];
+const RANDOM_DEBUG_PORT_MIN = 10000;
+const RANDOM_DEBUG_PORT_MAX = 65535;
 
 function isWindowsPath(value: string): boolean {
   return (
     /^[a-zA-Z]:[\\/]/.test(value) ||
-    value.startsWith("\\\\") ||
+    value.startsWith("\\") ||
     value.startsWith("%")
   );
 }
@@ -64,15 +83,49 @@ function parsePortOrThrow(
   return parsed;
 }
 
+function selectRandomDebugPort(): number {
+  return (
+    Math.floor(Math.random() * (RANDOM_DEBUG_PORT_MAX - RANDOM_DEBUG_PORT_MIN + 1)) +
+    RANDOM_DEBUG_PORT_MIN
+  );
+}
+
 function normalizeWindowsUserDataDir(value: string): string {
-  if (value.startsWith("/")) {
-    return value;
-  }
   return value.replaceAll("/", "\\");
 }
 
+function restoreWindowsPathFromResolvedLinuxPath(value: string): string | null {
+  if (!value.startsWith("/")) {
+    return null;
+  }
+
+  const tail = value.slice(value.lastIndexOf("/") + 1);
+  if (!tail || !isWindowsPath(tail)) {
+    return null;
+  }
+
+  return normalizeWindowsUserDataDir(tail);
+}
+
+function toWindowsUserDataDir(value: string): string | null {
+  if (isWindowsPath(value)) {
+    return normalizeWindowsUserDataDir(value);
+  }
+
+  const restored = restoreWindowsPathFromResolvedLinuxPath(value);
+  if (restored) {
+    return restored;
+  }
+
+  return null;
+}
+
+/**
+ * Parse and normalize launch arguments into a concrete bridge launch plan.
+ */
 export function planBridgeLaunch(
-  chromeArgs: string[]
+  chromeArgs: string[],
+  env: NodeJS.ProcessEnv = {}
 ): BridgeLaunchPlan {
   const passthroughArgs: string[] = [];
   let userDataDir: string | null = null;
@@ -81,50 +134,86 @@ export function planBridgeLaunch(
   let bridgeChromeExecutablePath: string | null = null;
   let bridgeRemoteDebugPort: number | null = null;
   let requestedLocalDebugPort: number | null = null;
+  let envRemoteDebugPort: number | null = null;
+  let envWindowsUserDataDir: string | null = null;
+  let usePipeTransport = false;
+
+  const envRemoteDebugPortRaw = env.WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT?.trim();
+  if (envRemoteDebugPortRaw) {
+    envRemoteDebugPort = parsePortOrThrow(
+      envRemoteDebugPortRaw,
+      "WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT"
+    );
+  }
+
+  const envChromeExecutablePathRaw = env.WSL_CHROME_BRIDGE_EXECUTABLE_PATH?.trim();
+  if (envChromeExecutablePathRaw) {
+    bridgeChromeExecutablePath = envChromeExecutablePathRaw;
+  }
+
+  const envUserDataDirRaw = env.WSL_CHROME_BRIDGE_USER_DATA_DIR?.trim();
+  if (envUserDataDirRaw) {
+    if (!isWindowsPath(envUserDataDirRaw)) {
+      throw new Error(
+        `[wsl-chrome-bridge] invalid WSL_CHROME_BRIDGE_USER_DATA_DIR: "${envUserDataDirRaw}". ` +
+          "Value must be a Windows-style path."
+      );
+    }
+    envWindowsUserDataDir = normalizeWindowsUserDataDir(envUserDataDirRaw);
+  }
 
   for (let i = 0; i < chromeArgs.length; i += 1) {
     const arg = chromeArgs[i];
 
     if (arg === "--remote-debugging-pipe") {
+      usePipeTransport = true;
       continue;
     }
 
-    if (arg.startsWith("--remote-debugging-port=")) {
-      requestedLocalDebugPort = parsePortOrThrow(
-        arg.split("=").slice(1).join("="),
-        "--remote-debugging-port"
-      );
+    const localRemoteDebugPortFlag = LOCAL_REMOTE_DEBUGGING_PORT_FLAGS.find(
+      (flag) => arg === flag || arg.startsWith(`${flag}=`)
+    );
+
+    if (localRemoteDebugPortFlag) {
+      if (arg === localRemoteDebugPortFlag) {
+        requestedLocalDebugPort = parsePortOrThrow(
+          readFlagValue(chromeArgs, i),
+          localRemoteDebugPortFlag
+        );
+        i += 1;
+      } else {
+        requestedLocalDebugPort = parsePortOrThrow(
+          arg.split("=").slice(1).join("="),
+          localRemoteDebugPortFlag
+        );
+      }
       continue;
     }
 
-    if (arg === "--remote-debugging-port") {
-      requestedLocalDebugPort = parsePortOrThrow(
-        readFlagValue(chromeArgs, i),
-        "--remote-debugging-port"
-      );
-      i += 1;
-      continue;
-    }
-
-    if (arg.startsWith("--remote-debugging-address=") || arg === "--remote-debugging-address") {
-      if (arg === "--remote-debugging-address") {
+    if (
+      arg.startsWith("--remote-debugging-address=") ||
+      arg.startsWith("--remote-debug-address=") ||
+      arg === "--remote-debugging-address" ||
+      arg === "--remote-debug-address"
+    ) {
+      if (arg === "--remote-debugging-address" || arg === "--remote-debug-address") {
         i += 1;
       }
       continue;
     }
 
     if (arg.startsWith("--bridge-debug-file=")) {
-      bridgeDebugFile = arg.split("=").slice(1).join("=");
-      continue;
+      throw new Error(
+        "[wsl-chrome-bridge] --bridge-debug-file is deprecated. " +
+          "Use WSL_CHROME_BRIDGE_DEBUG_FILE instead."
+      );
     }
 
     if (arg === "--bridge-debug-file") {
-      const value = readFlagValue(chromeArgs, i);
-      if (value) {
-        bridgeDebugFile = value;
-        i += 1;
-      }
-      continue;
+      throw new Error(
+        "[wsl-chrome-bridge] --bridge-debug-file is deprecated. " +
+          "Use WSL_CHROME_BRIDGE_DEBUG_FILE instead."
+      );
     }
 
     const bridgeChromeExecutableFlag = BRIDGE_CHROME_EXECUTABLE_FLAGS.find(
@@ -132,16 +221,10 @@ export function planBridgeLaunch(
     );
 
     if (bridgeChromeExecutableFlag) {
-      if (arg === bridgeChromeExecutableFlag) {
-        const value = readFlagValue(chromeArgs, i);
-        if (value) {
-          bridgeChromeExecutablePath = value;
-          i += 1;
-        }
-      } else {
-        bridgeChromeExecutablePath = arg.split("=").slice(1).join("=");
-      }
-      continue;
+      throw new Error(
+        `[wsl-chrome-bridge] ${bridgeChromeExecutableFlag} is deprecated. ` +
+          "Use WSL_CHROME_BRIDGE_EXECUTABLE_PATH instead."
+      );
     }
 
     const bridgeRemoteDebugPortFlag = BRIDGE_REMOTE_DEBUGGING_PORT_FLAGS.find(
@@ -166,9 +249,10 @@ export function planBridgeLaunch(
 
     if (arg.startsWith("--user-data-dir=")) {
       const value = arg.split("=").slice(1).join("=");
-      if (isWindowsPath(value)) {
-        userDataDir = value;
-        windowsUserDataDir = value;
+      userDataDir = value;
+      const resolvedWindowsUserDataDir = toWindowsUserDataDir(value);
+      if (resolvedWindowsUserDataDir) {
+        windowsUserDataDir = resolvedWindowsUserDataDir;
         passthroughArgs.push(arg);
       }
       continue;
@@ -177,9 +261,10 @@ export function planBridgeLaunch(
     if (arg === "--user-data-dir") {
       const value = readFlagValue(chromeArgs, i);
       if (value) {
-        if (isWindowsPath(value)) {
-          userDataDir = value;
-          windowsUserDataDir = value;
+        userDataDir = value;
+        const resolvedWindowsUserDataDir = toWindowsUserDataDir(value);
+        if (resolvedWindowsUserDataDir) {
+          windowsUserDataDir = resolvedWindowsUserDataDir;
           passthroughArgs.push(arg, value);
         }
         i += 1;
@@ -189,9 +274,10 @@ export function planBridgeLaunch(
 
     if (arg.startsWith("--userDataDir=")) {
       const value = arg.split("=").slice(1).join("=");
-      if (isWindowsPath(value)) {
-        userDataDir = value;
-        windowsUserDataDir = value;
+      userDataDir = value;
+      const resolvedWindowsUserDataDir = toWindowsUserDataDir(value);
+      if (resolvedWindowsUserDataDir) {
+        windowsUserDataDir = resolvedWindowsUserDataDir;
         passthroughArgs.push(arg);
       }
       continue;
@@ -200,9 +286,10 @@ export function planBridgeLaunch(
     if (arg === "--userDataDir") {
       const value = readFlagValue(chromeArgs, i);
       if (value) {
-        if (isWindowsPath(value)) {
-          userDataDir = value;
-          windowsUserDataDir = value;
+        userDataDir = value;
+        const resolvedWindowsUserDataDir = toWindowsUserDataDir(value);
+        if (resolvedWindowsUserDataDir) {
+          windowsUserDataDir = resolvedWindowsUserDataDir;
           passthroughArgs.push(arg, value);
         }
         i += 1;
@@ -213,37 +300,59 @@ export function planBridgeLaunch(
     passthroughArgs.push(arg);
   }
 
-  let createdUserDataDir = false;
-  if (!userDataDir) {
-    userDataDir = mkdtempSync(join(tmpdir(), "wsl-chrome-bridge-profile-"));
-    createdUserDataDir = true;
-    passthroughArgs.push(`--user-data-dir=${userDataDir}`);
-  }
-  if (!windowsUserDataDir) {
-    windowsUserDataDir = DEFAULT_WINDOWS_USER_DATA_DIR;
-  } else {
-    windowsUserDataDir = normalizeWindowsUserDataDir(windowsUserDataDir);
+  const createdUserDataDir = false;
+
+  if (!bridgeDebugFile) {
+    const envDebugFile = env.WSL_CHROME_BRIDGE_DEBUG_FILE?.trim();
+    if (envDebugFile) {
+      // Keep CLI behavior as highest priority and only use env as a fallback.
+      bridgeDebugFile = envDebugFile;
+    }
   }
 
-  if (requestedLocalDebugPort === null) {
-    requestedLocalDebugPort = 9222;
+  const localProxyPort = requestedLocalDebugPort;
+  let windowsDebugPortSource: BridgeLaunchPlan["windowsDebugPortSource"] = "auto-random";
+  let windowsDebugPort = selectRandomDebugPort();
+  let windowsUserDataDirSource: BridgeLaunchPlan["windowsUserDataDirSource"] = "none";
+
+  if (bridgeRemoteDebugPort !== null) {
+    windowsDebugPort = bridgeRemoteDebugPort;
+    windowsDebugPortSource = "bridge-arg";
+  } else if (envRemoteDebugPort !== null) {
+    windowsDebugPort = envRemoteDebugPort;
+    windowsDebugPortSource = "env";
+  } else if (requestedLocalDebugPort !== null) {
+    windowsDebugPort = requestedLocalDebugPort;
+    windowsDebugPortSource = "upstream-port";
   }
 
-  const windowsDebugPort = bridgeRemoteDebugPort ?? requestedLocalDebugPort;
+  if (envWindowsUserDataDir) {
+    windowsUserDataDir = envWindowsUserDataDir;
+    windowsUserDataDirSource = "env";
+  } else if (windowsUserDataDir) {
+    windowsUserDataDirSource = "arg";
+  }
 
   return {
     originalArgs: [...chromeArgs],
     passthroughArgs,
+    usePipeTransport,
     bridgeDebugFile,
     bridgeChromeExecutablePath,
     userDataDir,
     windowsUserDataDir,
+    windowsUserDataDirSource,
     requestedLocalDebugPort,
+    localProxyPort,
     windowsDebugPort,
+    windowsDebugPortSource,
     createdUserDataDir
   };
 }
 
+/**
+ * Build final Chrome arguments used to launch Windows Chrome.
+ */
 export function buildWindowsChromeArgs(
   plan: BridgeLaunchPlan,
   env: NodeJS.ProcessEnv = process.env
@@ -269,15 +378,23 @@ export function buildWindowsChromeArgs(
     (arg) => !arg.startsWith("--remote-allow-origins")
   );
 
-  return [
-    `--user-data-dir=${plan.windowsUserDataDir}`,
+  const launchArgs = [
     `--remote-debugging-port=${plan.windowsDebugPort}`,
     "--remote-debugging-address=127.0.0.1",
     "--remote-allow-origins=*",
     ...withoutRemoteAllowOrigins
   ];
+
+  if (plan.windowsUserDataDir) {
+    launchArgs.unshift(`--user-data-dir=${plan.windowsUserDataDir}`);
+  }
+
+  return launchArgs;
 }
 
+/**
+ * Parse browser websocket path from a full websocket URL.
+ */
 export function parseBrowserPathFromWsUrl(wsUrl: string): string {
   const parsed = new URL(wsUrl);
   return parsed.pathname + parsed.search;

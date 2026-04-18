@@ -5,11 +5,22 @@ import {
 } from "../../src/chrome-command.js";
 
 describe("resolveChromeCommand", () => {
-  it("uses bridge-chrome-executablePath when provided", () => {
+  it("uses explicit bridge chrome executable path when provided", () => {
     const command = resolveChromeCommand({
       bridgeChromeExecutablePath: "/mnt/c/Custom/Chrome/chrome.exe",
       env: {
         WSL_DISTRO_NAME: "Ubuntu"
+      }
+    });
+
+    expect(command).toBe("C:\\Custom\\Chrome\\chrome.exe");
+  });
+
+  it("uses WSL_CHROME_BRIDGE_EXECUTABLE_PATH when provided", () => {
+    const command = resolveChromeCommand({
+      env: {
+        WSL_DISTRO_NAME: "Ubuntu",
+        WSL_CHROME_BRIDGE_EXECUTABLE_PATH: "/mnt/c/Custom/Chrome/chrome.exe"
       }
     });
 

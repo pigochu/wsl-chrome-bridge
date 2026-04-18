@@ -15,25 +15,32 @@ With the original `chrome-devtools-mcp` setup, you only need to change `--execut
 
 This idea came from [wsl-chrome-mcp](https://github.com/477174/wsl-chrome-mcp), which uses PowerShell to work around the same limitation. That project provides MCP server capability itself, while this project keeps using the widely maintained `chrome-devtools-mcp` and adds a bridge layer.
 
+## Breaking Changes in 0.2.0 (Playwright Support)
+
+`0.2.0` adds `playwright-mcp` compatibility and includes multiple bridge argument/configuration adjustments.
+
+If you are upgrading from `0.1.0`, read the upgrade guide first: [UPGRADE.md](./UPGRADE.md).
+
 ## How It Works
 
 ```text
-[chrome-devtools-mcp]
-       |
-    stdio pipe
-       |
-[wsl-chrome-bridge]
-       |
- PowerShell websocket relay
-       |
-[Windows Chrome]
+[Chrome DevTools MCP]             [Playwright MCP]
+         |                              |
+      stdio pipe                remote-debugging-port
+         |                              |
+         +------[wsl-chrome-bridge]-----+
+                         |
+            PowerShell websocket relay
+                         |
+                 [Windows Chrome]
 ```
 
 `wsl-chrome-bridge` will:
 
-- Accept Chrome launch arguments from `chrome-devtools-mcp`
+- Accept Chrome launch arguments from both `chrome-devtools-mcp` and `playwright-mcp`
 - Launch Windows Chrome via PowerShell
-- Receive/return CDP messages through stdio pipe (OS pipe)
+- In `chrome-devtools-mcp` mode, receive/return CDP messages through stdio pipe (OS pipe)
+- In `playwright-mcp` mode, create a local WebSocket proxy on the mapped port and forward CDP traffic through it
 - Relay CDP messages bidirectionally to Windows Chrome through PowerShell websocket relay
 
 ## Requirements
@@ -49,12 +56,22 @@ This idea came from [wsl-chrome-mcp](https://github.com/477174/wsl-chrome-mcp), 
 In WSL, choose one of the following installation methods:
 
 1. Install globally with `npm install -g wsl-chrome-bridge`.
-2. Or clone source and install with `npm link`.
+2. Or clone source, build it, then install with `npm link`:
+
+```bash
+git clone https://github.com/pigochu/wsl-chrome-bridge.git
+cd wsl-chrome-bridge
+npm install
+npm run build
+npm link
+```
 
 ### Example (Codex)
 
 1. Find the actual path of `wsl-chrome-bridge`, for example `/home/pigochu/.local/share/mise/shims/wsl-chrome-bridge`.
-2. Configure `.codex/config.toml` like this:
+2. Configure `.codex/config.toml` like this.
+
+Minimal working `chrome-devtools-mcp` setup:
 
 ```toml
 [sandbox_workspace_write]
@@ -66,20 +83,41 @@ args = [
     "-y",
     "chrome-devtools-mcp@latest",
     "--executablePath",
-    "/home/pigochu/.local/share/mise/shims/wsl-chrome-bridge",
-    "--chrome-arg=--window-size=720,400",
-    "--chrome-arg=--new-window",
-    "--chrome-arg=--user-data-dir=%TEMP%\\wsl-chrome-bridge\\chrome-profile-test",
-    "--chrome-arg=--bridge-remote-debugging-port=9222",
-    "--no-sandbox"
+    "/home/pigochu/.local/share/mise/shims/wsl-chrome-bridge"
 ]
 enabled = true
 ```
 
-In this example, Windows Chrome is launched with port `9222`, and `wsl-chrome-bridge` relays traffic between Windows Chrome and `chrome-devtools-mcp`.
+This is the minimum working setup. `wsl-chrome-bridge` launches Windows Chrome and relays CDP traffic for `chrome-devtools-mcp` without extra bridge-specific arguments.
+
+Minimal working `playwright-mcp` setup (with sandbox):
+
+```toml
+[sandbox_workspace_write]
+network_access = true
+
+[mcp_servers.playwright]
+command = "npx"
+args = [
+    "-y",
+    "@playwright/mcp@latest",
+    "--browser",
+    "chrome",
+    "--sandbox",
+    "--executable-path",
+    "/home/pigochu/.local/share/mise/shims/wsl-chrome-bridge"
+]
+enabled = true
+
+[mcp_servers.playwright.env]
+DISPLAY = ":9999"
+```
+
+In bridge + system Chrome usage, `--browser chrome` helps avoid upstream `--no-sandbox` warning behavior while keeping Playwright launch behavior stable.
 
 > [!NOTE]
 > See the FAQ for how to locate `--executablePath`.
+> For more configuration patterns, see `agent-config-sample/.codex/`.
 
 ## Development Stack
 
@@ -144,23 +182,63 @@ ls -la ~/.local/share/mise/shims/wsl-chrome-bridge
 - Without a version manager, `command -v` is a direct and valid way to get an absolute path.
 - With mise multi-version Node, prefer `/home/<user>/.local/share/mise/shims/wsl-chrome-bridge` so path does not break when Node versions change.
 
-### Why `--user-data-dir` is not recommended
+### Why Playwright needs `DISPLAY`
 
-`chrome-devtools-mcp` checks whether `--user-data-dir` is an absolute path (starts with `/`). If not, it may be treated as relative, which does not work well with `%TEMP%\\...` style values. Use `--chrome-arg=--user-data-dir=...` instead.
+In WSL/Linux, `playwright-mcp` checks display availability before launching the browser.  
+If `DISPLAY` is not set, Playwright often switches to headless behavior (even when you did not explicitly pass `--headless`).
+
+That decision happens upstream before bridge logic starts, so `wsl-chrome-bridge` cannot override it later.  
+If you want to see a visible Chrome window on Windows, set `DISPLAY` in MCP `env` (for example `DISPLAY=:999`).
+
+### Why Playwright may show `--no-sandbox` warning
+
+When `playwright-mcp` is launched without an explicit browser channel, it may resolve to launch args that include `--no-sandbox`. In headed Chrome, this shows the warning banner:
+`You are using an unsupported command-line flag: --no-sandbox`.
+
+For bridge usage with system Chrome, recommend adding:
+
+```text
+--browser chrome
+```
+
+This keeps Playwright on the Chrome channel and avoids passing `--no-sandbox` in the common setup.
+
+### About `--user-data-dir`
+
+`wsl-chrome-bridge` accepts direct `--user-data-dir` / `--userDataDir` values from upstream MCP.
+
+Playwright may resolve a Windows-style path into a Linux path and pre-create a local empty directory before bridge logic starts.  
+Bridge checks that local path and removes it only when it is an empty directory. Non-empty directories are never removed.
+
+`chrome-devtools-mcp` typically does not create this local empty-directory artifact.
+
+Bridge only passes Windows-style user-data-dir values to Windows Chrome. Path-resolved forms like `/cwd/%TEMP%\\...` are restored back to the original Windows-style path when possible.
+
+To avoid Playwright-specific differences and keep a unified config style across `chrome-devtools-mcp` and `playwright-mcp`, prefer setting:
+
+```toml
+WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx"
+```
+
+`--user-data-dir` still works, but `WSL_CHROME_BRIDGE_USER_DATA_DIR` is recommended as the default style.
 
 ## Important Argument Notes
 
-- `--user-data-dir`: this original `chrome-devtools-mcp` option is not recommended here. It may pass an unexpected path and should be avoided.
-- `--chrome-arg=--user-data-dir=...`: set Chrome profile path.
-- `--chrome-arg=--bridge-chrome-executablePath=...`: optionally set the Chrome executable absolute path (Windows format required, for example `C:\\...`).
-- `--chrome-arg=--bridge-remote-debugging-port=9222`: optionally set the Windows Chrome debug port. Default is `9222` if omitted. This is a bridge-only argument, not a native Chrome flag.
-- `--chrome-arg=--bridge-debug-file=/tmp/xxx.log`: optional debug output file in WSL.
+- `--user-data-dir` / `--userDataDir`: Bridge only forwards this flag when the final value is Windows-style (including restored `%TEMP%\\...` forms).
+- `playwright-mcp --browser chrome`: recommended for bridge usage to avoid upstream `--no-sandbox` banner in headed Chrome.
+
+## Important Environment Variables
+
+- `WSL_CHROME_BRIDGE_USER_DATA_DIR=%TEMP%\\...`: recommended default profile setting. It forces the Windows Chrome profile path, takes precedence over upstream `--user-data-dir`, avoids Playwright local empty-dir artifacts, and keeps a unified config style across MCP servers.
+- `WSL_CHROME_BRIDGE_EXECUTABLE_PATH=C:\\...`: optional environment variable to override the Windows Chrome executable path.
+- `WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT=9222`: optional environment variable for Windows Chrome debug port. If no port is specified, bridge uses a random port instead of fixed `9222`.
+- Bridge now probes port availability on Windows before launching Chrome. In fixed-port mode, startup fails fast if that port is already occupied.
+- `WSL_CHROME_BRIDGE_DEBUG_FILE=/tmp/xxx.log`: optional debug output file in WSL.
 
 ### Known incompatible original arguments
 
-The following original `chrome-devtools-mcp` options are currently known as incompatible in this bridge setup:
+The following original `chrome-devtools-mcp` option is currently known as incompatible in this bridge setup:
 
-- `--user-data-dir`: internal handling in `chrome-devtools-mcp` may turn an intended Windows-style path into Linux-style behavior, so this option is filtered out by this bridge and is not recommended for profile path configuration.
-- `--browser-url`: this enables remote-connection mode in `chrome-devtools-mcp` instead of pipe mode, so it cannot work with `wsl-chrome-bridge`. Use `--chrome-arg=--bridge-remote-debugging-port=...` instead.
+- `--browser-url`: this enables remote-connection mode in `chrome-devtools-mcp` instead of pipe mode, so it cannot work with `wsl-chrome-bridge`.
 
 > Other original `chrome-devtools-mcp` arguments are not all fully validated yet. This project is still under development, so only currently tested limitations are listed here.

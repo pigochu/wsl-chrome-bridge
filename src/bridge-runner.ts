@@ -3,14 +3,23 @@ import {
   createReadStream,
   createWriteStream,
   fstatSync,
+  lstatSync,
   mkdirSync,
+  readdirSync,
+  rmdirSync,
   rmSync,
   writeFileSync
 } from "node:fs";
 import { once } from "node:events";
+import { createServer, type IncomingMessage } from "node:http";
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
-import { buildWindowsChromeArgs, planBridgeLaunch } from "./bridge-options.js";
+import { WebSocket, WebSocketServer } from "ws";
+import {
+  buildWindowsChromeArgs,
+  parseBrowserPathFromWsUrl,
+  planBridgeLaunch
+} from "./bridge-options.js";
 import { resolveChromeCommand } from "./chrome-command.js";
 import {
   createPowerShellContext,
@@ -58,6 +67,64 @@ try {
 } catch {
   exit 1
 }
+`;
+
+const RESOLVE_PORT_PS = `
+param(
+  [int]$RequestedPort,
+  [string]$Mode
+)
+$ErrorActionPreference = 'Stop'
+
+function Test-PortAvailable {
+  param([int]$Port)
+  try {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+    $listener.Start()
+    $listener.Stop()
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Get-RandomFreePort {
+  $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+  $listener.Start()
+  $allocated = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+  $listener.Stop()
+  return $allocated
+}
+
+if ($Mode -eq "fixed") {
+  if (-not (Test-PortAvailable -Port $RequestedPort)) {
+    Write-Error "Port $RequestedPort is already in use on Windows."
+    exit 2
+  }
+  Write-Output $RequestedPort
+  exit 0
+}
+
+if ($Mode -eq "random") {
+  if ($RequestedPort -gt 0 -and (Test-PortAvailable -Port $RequestedPort)) {
+    Write-Output $RequestedPort
+    exit 0
+  }
+
+  for ($i = 0; $i -lt 50; $i++) {
+    $candidate = Get-RandomFreePort
+    if (Test-PortAvailable -Port $candidate) {
+      Write-Output $candidate
+      exit 0
+    }
+  }
+
+  Write-Error "Failed to allocate an available Windows debug port."
+  exit 3
+}
+
+Write-Error "Unsupported mode: $Mode"
+exit 4
 `;
 
 const STOP_PROCESS_PS = `
@@ -164,11 +231,194 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+interface LocalDebugProxyContext {
+  close: () => Promise<void>;
+  broadcast: (message: string) => void;
+}
+
+interface StartLocalDebugProxyOptions {
+  port: number;
+  browserPath: string;
+  localBrowserWsUrl: string;
+  localVersionPayload: Record<string, unknown>;
+  writeDebug: (message: string) => void;
+  onClientMessage: (message: string) => void;
+}
+
+function detectUpstreamHint(chromeArgs: string[]): "chrome-devtools-mcp" | "playwright-mcp" | "unknown" {
+  const hasPipeMode = chromeArgs.includes("--remote-debugging-pipe");
+  const hasRemoteDebugPort =
+    chromeArgs.some((arg) => arg.startsWith("--remote-debugging-port=")) ||
+    chromeArgs.some((arg) => arg.startsWith("--remote-debug-port=")) ||
+    chromeArgs.includes("--remote-debugging-port") ||
+    chromeArgs.includes("--remote-debug-port");
+
+  if (hasPipeMode && !hasRemoteDebugPort) {
+    return "chrome-devtools-mcp";
+  }
+  if (!hasPipeMode && hasRemoteDebugPort) {
+    return "playwright-mcp";
+  }
+  return "unknown";
+}
+
+function collectBridgeEnvSnapshot(env: NodeJS.ProcessEnv): Record<string, string | null> {
+  return {
+    WSL_CHROME_BRIDGE_DEBUG: env.WSL_CHROME_BRIDGE_DEBUG ?? null,
+    WSL_CHROME_BRIDGE_DEBUG_FILE: env.WSL_CHROME_BRIDGE_DEBUG_FILE ?? null,
+    WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT: env.WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT ?? null,
+    WSL_CHROME_BRIDGE_EXECUTABLE_PATH: env.WSL_CHROME_BRIDGE_EXECUTABLE_PATH ?? null,
+    WSL_CHROME_BRIDGE_USER_DATA_DIR: env.WSL_CHROME_BRIDGE_USER_DATA_DIR ?? null,
+    DISPLAY: env.DISPLAY ?? null
+  };
+}
+
+function cleanupEmptyLocalUserDataDirArtifact(
+  userDataDir: string | null,
+  writeDebug: (message: string) => void
+): void {
+  if (!userDataDir) {
+    return;
+  }
+
+  // Playwright can resolve Windows-like profile paths into a Linux absolute path
+  // and pre-create that directory. It is safe to clean it up only when still empty.
+  if (!userDataDir.startsWith("/")) {
+    writeDebug(`cleanup userDataDirArtifact skipped reason=non-linux-path path=${userDataDir}`);
+    return;
+  }
+
+  try {
+    const stats = lstatSync(userDataDir);
+    if (stats.isSymbolicLink()) {
+      writeDebug(`cleanup userDataDirArtifact skipped reason=symlink path=${userDataDir}`);
+      return;
+    }
+    if (!stats.isDirectory()) {
+      writeDebug(`cleanup userDataDirArtifact skipped reason=not-directory path=${userDataDir}`);
+      return;
+    }
+
+    const entries = readdirSync(userDataDir);
+    if (entries.length > 0) {
+      writeDebug(
+        `cleanup userDataDirArtifact skipped reason=not-empty path=${userDataDir} entries=${entries.length}`
+      );
+      return;
+    }
+
+    // Remove only an empty directory. This never removes non-empty paths.
+    rmdirSync(userDataDir);
+    writeDebug(`cleanup userDataDirArtifact removed path=${userDataDir}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    writeDebug(`cleanup userDataDirArtifact skipped reason=error path=${userDataDir} error=${message}`);
+  }
+}
+
+function hasPipeFds(): boolean {
+  try {
+    fstatSync(3);
+    fstatSync(4);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function startLocalDebugProxy(
+  options: StartLocalDebugProxyOptions
+): Promise<LocalDebugProxyContext> {
+  const clients = new Set<WebSocket>();
+  const wsServer = new WebSocketServer({ noServer: true });
+  const server = createServer((req, res) => {
+    const reqUrl = req.url ?? "/";
+    if (reqUrl === "/json/version") {
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(options.localVersionPayload));
+      return;
+    }
+    if (reqUrl === "/json" || reqUrl === "/json/list") {
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      res.end(
+        JSON.stringify([
+          {
+            id: "wsl-chrome-bridge-browser",
+            type: "browser",
+            webSocketDebuggerUrl: options.localBrowserWsUrl
+          }
+        ])
+      );
+      return;
+    }
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+    res.end("Not Found");
+  });
+
+  server.on("upgrade", (req: IncomingMessage, socket, head) => {
+    const reqUrl = req.url ?? "";
+    if (reqUrl !== options.browserPath) {
+      socket.destroy();
+      return;
+    }
+    wsServer.handleUpgrade(req, socket, head, (client) => {
+      wsServer.emit("connection", client, req);
+    });
+  });
+
+  wsServer.on("connection", (client) => {
+    clients.add(client);
+    options.writeDebug("localProxy client connected");
+    client.on("message", (data) => {
+      const message = typeof data === "string" ? data : data.toString("utf8");
+      if (!message) {
+        return;
+      }
+      options.onClientMessage(message);
+    });
+    client.on("close", () => {
+      clients.delete(client);
+      options.writeDebug("localProxy client disconnected");
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => reject(error);
+    server.once("error", onError);
+    server.listen(options.port, "127.0.0.1", () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+
+  return {
+    close: async () => {
+      for (const client of clients) {
+        try {
+          client.close();
+        } catch {
+          // ignore
+        }
+      }
+      await new Promise<void>((resolve) => wsServer.close(() => resolve()));
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+    broadcast: (message: string) => {
+      for (const client of clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(message);
+        }
+      }
+    }
+  };
+}
+
 export function createBridgeRunner() {
   return async function runBridge(chromeArgs: string[]): Promise<number> {
     const env = process.env;
-    const plan = planBridgeLaunch(chromeArgs);
-    const debug = env.WSL_CHROME_BRIDGE_DEBUG === "1" || Boolean(plan.bridgeDebugFile);
+    const debugFileFromEnv = env.WSL_CHROME_BRIDGE_DEBUG_FILE?.trim() || null;
+    let activeDebugFile = debugFileFromEnv;
+    const debug = env.WSL_CHROME_BRIDGE_DEBUG === "1" || Boolean(activeDebugFile);
 
     const writeDebug = (message: string): void => {
       if (!debug) {
@@ -176,27 +426,58 @@ export function createBridgeRunner() {
       }
       const line = `[${new Date().toISOString()}] ${message}\n`;
       process.stderr.write(`[wsl-chrome-bridge][debug] ${message}\n`);
-      if (plan.bridgeDebugFile) {
+      if (activeDebugFile) {
         try {
-          mkdirSync(dirname(plan.bridgeDebugFile), { recursive: true });
-          appendFileSync(plan.bridgeDebugFile, line, "utf8");
+          mkdirSync(dirname(activeDebugFile), { recursive: true });
+          appendFileSync(activeDebugFile, line, "utf8");
         } catch {
           // keep running even if debug file write fails
         }
       }
     };
 
-    if (plan.bridgeDebugFile) {
+    if (activeDebugFile) {
       try {
-        mkdirSync(dirname(plan.bridgeDebugFile), { recursive: true });
+        mkdirSync(dirname(activeDebugFile), { recursive: true });
         writeFileSync(
-          plan.bridgeDebugFile,
+          activeDebugFile,
           `[${new Date().toISOString()}] bridge debug file created\n`,
           "utf8"
         );
       } catch {
         process.stderr.write(
-          `[wsl-chrome-bridge] failed to create debug file: ${plan.bridgeDebugFile}\n`
+          `[wsl-chrome-bridge] failed to create debug file: ${activeDebugFile}\n`
+        );
+      }
+    }
+
+    writeDebug(`startupContext=${JSON.stringify({
+      upstreamHint: detectUpstreamHint(chromeArgs),
+      argv: chromeArgs,
+      env: collectBridgeEnvSnapshot(env)
+    })}`);
+
+    let plan: ReturnType<typeof planBridgeLaunch>;
+    try {
+      plan = planBridgeLaunch(chromeArgs, env);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      writeDebug(`planBridgeLaunchFailed message=${message}`);
+      throw error;
+    }
+
+    if (!activeDebugFile && plan.bridgeDebugFile) {
+      activeDebugFile = plan.bridgeDebugFile;
+      try {
+        mkdirSync(dirname(activeDebugFile), { recursive: true });
+        writeFileSync(
+          activeDebugFile,
+          `[${new Date().toISOString()}] bridge debug file created\n`,
+          "utf8"
+        );
+      } catch {
+        process.stderr.write(
+          `[wsl-chrome-bridge] failed to create debug file: ${activeDebugFile}\n`
         );
       }
     }
@@ -205,29 +486,86 @@ export function createBridgeRunner() {
     writeDebug(`launchPlan=${JSON.stringify({
       bridgeDebugFile: plan.bridgeDebugFile,
       bridgeChromeExecutablePath: plan.bridgeChromeExecutablePath,
+      usePipeTransport: plan.usePipeTransport,
       userDataDir: plan.userDataDir,
       windowsUserDataDir: plan.windowsUserDataDir,
+      windowsUserDataDirSource: plan.windowsUserDataDirSource,
       requestedLocalDebugPort: plan.requestedLocalDebugPort,
+      localProxyPort: plan.localProxyPort,
       windowsDebugPort: plan.windowsDebugPort,
+      windowsDebugPortSource: plan.windowsDebugPortSource,
       passthroughArgs: plan.passthroughArgs
     })}`);
+
+    cleanupEmptyLocalUserDataDirArtifact(plan.userDataDir, writeDebug);
+
+    const cleanupUserDataDirOnExit = (reason: string): void => {
+      if (!(plan.createdUserDataDir && plan.userDataDir)) {
+        return;
+      }
+      rmSync(plan.userDataDir, { recursive: true, force: true });
+      writeDebug(`cleanup userDataDir removed reason=${reason} path=${plan.userDataDir}`);
+    };
 
     const powerShell = createPowerShellContext(env);
     writeDebug(`powershellPath=${powerShell.powershellPath}`);
 
     const launchScript = writePowerShellScript(powerShell, "launch-chrome.ps1", LAUNCH_CHROME_PS);
     const getVersionScript = writePowerShellScript(powerShell, "get-version.ps1", GET_VERSION_PS);
+    const resolvePortScript = writePowerShellScript(powerShell, "resolve-port.ps1", RESOLVE_PORT_PS);
     const stopProcessScript = writePowerShellScript(powerShell, "stop-process.ps1", STOP_PROCESS_PS);
     const relayScript = writePowerShellScript(powerShell, "relay.ps1", RELAY_PS);
     writeDebug(
-      `scripts={launch:${launchScript.windowsPath},version:${getVersionScript.windowsPath},stop:${stopProcessScript.windowsPath},relay:${relayScript.windowsPath}}`
+      `scripts={launch:${launchScript.windowsPath},version:${getVersionScript.windowsPath},resolvePort:${resolvePortScript.windowsPath},stop:${stopProcessScript.windowsPath},relay:${relayScript.windowsPath}}`
     );
+
+    const resolvePortMode = plan.windowsDebugPortSource === "auto-random" ? "random" : "fixed";
+    const resolvePortResult = await runPowerShellFile(
+      powerShell,
+      resolvePortScript.windowsPath,
+      [String(plan.windowsDebugPort), resolvePortMode],
+      { timeoutMs: 8_000 }
+    );
+
+    if (resolvePortResult.code !== 0) {
+      writeDebug(
+        `resolvePortFailed mode=${resolvePortMode} requested=${plan.windowsDebugPort} code=${resolvePortResult.code} stdout=${resolvePortResult.stdout.trim()} stderr=${resolvePortResult.stderr.trim()}`
+      );
+      process.stderr.write(
+        "[wsl-chrome-bridge] failed to resolve an available Windows debug port: " +
+          `${resolvePortResult.stderr || resolvePortResult.stdout}\n`
+      );
+      destroyPowerShellContext(powerShell);
+      cleanupUserDataDirOnExit("resolvePortFailed");
+      return 1;
+    }
+
+    const resolvedWindowsDebugPort = Number.parseInt(resolvePortResult.stdout.trim(), 10);
+    if (!Number.isFinite(resolvedWindowsDebugPort)) {
+      writeDebug(
+        `resolvePortParseFailed raw=${resolvePortResult.stdout.trim()} stderr=${resolvePortResult.stderr.trim()}`
+      );
+      process.stderr.write(
+        "[wsl-chrome-bridge] failed to parse resolved Windows debug port from PowerShell output.\n"
+      );
+      destroyPowerShellContext(powerShell);
+      cleanupUserDataDirOnExit("resolvePortParseFailed");
+      return 1;
+    }
+    writeDebug(
+      `resolvedWindowsDebugPort=${resolvedWindowsDebugPort} source=${plan.windowsDebugPortSource} mode=${resolvePortMode}`
+    );
+
+    const planWithResolvedPort = {
+      ...plan,
+      windowsDebugPort: resolvedWindowsDebugPort
+    };
 
     const chromePath = resolveChromeCommand({
       env,
       bridgeChromeExecutablePath: plan.bridgeChromeExecutablePath
     });
-    const windowsArgs = buildWindowsChromeArgs(plan, env);
+    const windowsArgs = buildWindowsChromeArgs(planWithResolvedPort, env);
     writeDebug(`chromePath=${chromePath}`);
     writeDebug(`windowsArgs=${JSON.stringify(windowsArgs)}`);
 
@@ -244,9 +582,7 @@ export function createBridgeRunner() {
         `[wsl-chrome-bridge] failed to launch Windows Chrome: ${launchResult.stderr || launchResult.stdout}\n`
       );
       destroyPowerShellContext(powerShell);
-      if (plan.createdUserDataDir) {
-        rmSync(plan.userDataDir, { recursive: true, force: true });
-      }
+      cleanupUserDataDirOnExit("launchFailed");
       return 1;
     }
     writeDebug(
@@ -260,9 +596,7 @@ export function createBridgeRunner() {
         `[wsl-chrome-bridge] failed to parse Chrome PID from PowerShell output: ${launchResult.stdout}\n`
       );
       destroyPowerShellContext(powerShell);
-      if (plan.createdUserDataDir) {
-        rmSync(plan.userDataDir, { recursive: true, force: true });
-      }
+      cleanupUserDataDirOnExit("invalidChromePid");
       return 1;
     }
 
@@ -272,7 +606,7 @@ export function createBridgeRunner() {
       const result = await runPowerShellFile(
         powerShell,
         getVersionScript.windowsPath,
-        [String(plan.windowsDebugPort)],
+        [String(planWithResolvedPort.windowsDebugPort)],
         { timeoutMs: 4_000 }
       );
 
@@ -300,9 +634,7 @@ export function createBridgeRunner() {
         timeoutMs: 3_000
       });
       destroyPowerShellContext(powerShell);
-      if (plan.createdUserDataDir) {
-        rmSync(plan.userDataDir, { recursive: true, force: true });
-      }
+      cleanupUserDataDirOnExit("chromeDebugWsNotReady");
       return 1;
     }
 
@@ -330,27 +662,95 @@ export function createBridgeRunner() {
     relayChild.stdout.setEncoding("utf8");
     relayChild.stderr.setEncoding("utf8");
 
-    // chrome-devtools-mcp pipe mode uses fd3 (read by bridge) and fd4 (write by bridge).
-    try {
-      fstatSync(3);
-      fstatSync(4);
-    } catch {
+    const usePipeTransport = plan.usePipeTransport && hasPipeFds();
+    const useLocalProxyTransport = plan.localProxyPort !== null;
+    writeDebug(
+      `transportMode requestedPipe=${plan.usePipeTransport} pipe=${usePipeTransport} localProxy=${useLocalProxyTransport} localProxyPort=${plan.localProxyPort ?? "none"}`
+    );
+
+    if (plan.usePipeTransport && !usePipeTransport) {
       process.stderr.write(
-        "[wsl-chrome-bridge] missing OS pipe fds (3/4). " +
-          "This bridge must be launched via chrome-devtools-mcp pipe mode.\n"
+        "[wsl-chrome-bridge] --remote-debugging-pipe was requested but OS pipe fds (3/4) are missing.\n"
       );
       await runPowerShellFile(powerShell, stopProcessScript.windowsPath, [String(chromePid)], {
         timeoutMs: 3_000
       });
       destroyPowerShellContext(powerShell);
-      if (plan.createdUserDataDir) {
-        rmSync(plan.userDataDir, { recursive: true, force: true });
-      }
+      cleanupUserDataDirOnExit("pipeFdsMissing");
       return 1;
     }
 
-    const pipeIn = createReadStream("", { fd: 3, autoClose: false });
-    const pipeOut = createWriteStream("", { fd: 4, autoClose: false });
+    if (!usePipeTransport && !useLocalProxyTransport) {
+      process.stderr.write(
+        "[wsl-chrome-bridge] missing transport channel. " +
+          "Provide --remote-debugging-port (Playwright mode) or launch with OS pipes fd3/fd4.\n"
+      );
+      await runPowerShellFile(powerShell, stopProcessScript.windowsPath, [String(chromePid)], {
+        timeoutMs: 3_000
+      });
+      destroyPowerShellContext(powerShell);
+      cleanupUserDataDirOnExit("missingTransportChannel");
+      return 1;
+    }
+
+    let pipeIn: ReturnType<typeof createReadStream> | null = null;
+    let pipeOut: ReturnType<typeof createWriteStream> | null = null;
+    if (usePipeTransport) {
+      pipeIn = createReadStream("", { fd: 3, autoClose: false });
+      pipeOut = createWriteStream("", { fd: 4, autoClose: false });
+    }
+
+    const remoteBrowserPath = parseBrowserPathFromWsUrl(remoteBrowserWsUrl);
+    const localBrowserWsUrl =
+      plan.localProxyPort === null
+        ? null
+        : `ws://127.0.0.1:${plan.localProxyPort}${remoteBrowserPath}`;
+
+    let localProxy: LocalDebugProxyContext | null = null;
+    if (plan.localProxyPort !== null && localBrowserWsUrl) {
+      const localVersionPayload: Record<string, unknown> = {
+        ...remoteVersion,
+        webSocketDebuggerUrl: localBrowserWsUrl
+      };
+      try {
+        localProxy = await startLocalDebugProxy({
+          port: plan.localProxyPort,
+          browserPath: remoteBrowserPath,
+          localBrowserWsUrl,
+          localVersionPayload,
+          writeDebug,
+          onClientMessage: (message) => {
+            if (relayConnected) {
+              relayChild.stdin.write(`${message}\n`);
+            } else {
+              queuedForRelay.push(message);
+            }
+          }
+        });
+        writeDebug(`localProxy listening ws=${localBrowserWsUrl}`);
+        // Playwright's chromium launcher waits for this exact startup line when
+        // --remote-debugging-port mode is used. Emitting it here makes the bridge
+        // behave like a native Chromium process from Playwright's perspective.
+        process.stderr.write(`DevTools listening on ${localBrowserWsUrl}\n`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeDebug(`localProxy start failed: ${message}`);
+        process.stderr.write(
+          `[wsl-chrome-bridge] failed to start local websocket proxy on 127.0.0.1:${plan.localProxyPort}: ${message}\n`
+        );
+        try {
+          relayChild.kill("SIGTERM");
+        } catch {
+          // ignore
+        }
+        await runPowerShellFile(powerShell, stopProcessScript.windowsPath, [String(chromePid)], {
+          timeoutMs: 3_000
+        });
+        destroyPowerShellContext(powerShell);
+        cleanupUserDataDirOnExit("localProxyStartFailed");
+        return 1;
+      }
+    }
 
     let relayConnected = false;
     let relayStdoutBuffer = "";
@@ -366,8 +766,13 @@ export function createBridgeRunner() {
       closed = true;
       writeDebug(`cleanup start code=${code}`);
 
-      pipeIn.destroy();
-      pipeOut.destroy();
+      pipeIn?.destroy();
+      pipeOut?.destroy();
+
+      if (localProxy) {
+        await localProxy.close();
+        writeDebug("cleanup localProxy closed");
+      }
 
       try {
         relayChild.stdin.end();
@@ -389,10 +794,7 @@ export function createBridgeRunner() {
       destroyPowerShellContext(powerShell);
       writeDebug("cleanup powershell context destroyed");
 
-      if (plan.createdUserDataDir) {
-        rmSync(plan.userDataDir, { recursive: true, force: true });
-        writeDebug("cleanup temp userDataDir removed");
-      }
+      cleanupUserDataDirOnExit("cleanup");
       writeDebug(`cleanup complete code=${code}`);
       return code;
     };
@@ -466,38 +868,45 @@ export function createBridgeRunner() {
           if (!line) {
             continue;
           }
-          pipeOut.write(line);
-          pipeOut.write("\0");
+          if (pipeOut) {
+            pipeOut.write(line);
+            pipeOut.write("\0");
+          }
+          if (localProxy) {
+            localProxy.broadcast(line);
+          }
         }
       });
 
       relayChild.once("error", () => finalize(1));
       relayChild.once("exit", (code) => finalize(code === 0 ? 0 : 1));
 
-      pipeIn.on("data", (chunk: Buffer | string) => {
-        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
-        pendingFromPipe = Buffer.concat([pendingFromPipe, buf]);
-        while (true) {
-          const nullIndex = pendingFromPipe.indexOf(0);
-          if (nullIndex === -1) {
-            break;
+      if (pipeIn) {
+        pipeIn.on("data", (chunk: Buffer | string) => {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");
+          pendingFromPipe = Buffer.concat([pendingFromPipe, buf]);
+          while (true) {
+            const nullIndex = pendingFromPipe.indexOf(0);
+            if (nullIndex === -1) {
+              break;
+            }
+            const message = pendingFromPipe.subarray(0, nullIndex).toString("utf8");
+            pendingFromPipe = pendingFromPipe.subarray(nullIndex + 1);
+            if (!message) {
+              continue;
+            }
+            if (relayConnected) {
+              relayChild.stdin.write(`${message}\n`);
+            } else {
+              queuedForRelay.push(message);
+            }
           }
-          const message = pendingFromPipe.subarray(0, nullIndex).toString("utf8");
-          pendingFromPipe = pendingFromPipe.subarray(nullIndex + 1);
-          if (!message) {
-            continue;
-          }
-          if (relayConnected) {
-            relayChild.stdin.write(`${message}\n`);
-          } else {
-            queuedForRelay.push(message);
-          }
-        }
-      });
+        });
 
-      pipeIn.once("end", () => finalize(0));
-      pipeIn.once("error", () => finalize(1));
-      pipeOut.once("error", () => finalize(1));
+        pipeIn.once("end", () => finalize(0));
+        pipeIn.once("error", () => finalize(1));
+      }
+      pipeOut?.once("error", () => finalize(1));
     });
   };
 }

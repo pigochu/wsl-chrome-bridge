@@ -19,7 +19,9 @@ export function resolveChromeCommand(options: ChromeCommandOptions = {}): string
   const pathExists = options.pathExists ?? existsSync;
   const distroName = env.WSL_DISTRO_NAME;
 
-  const configuredPath = options.bridgeChromeExecutablePath?.trim();
+  const configuredPath =
+    options.bridgeChromeExecutablePath?.trim() ??
+    env.WSL_CHROME_BRIDGE_EXECUTABLE_PATH?.trim();
   if (configuredPath) {
     return (
       toWindowsPathIfNeeded(configuredPath, {

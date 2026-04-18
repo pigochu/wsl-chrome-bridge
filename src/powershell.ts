@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { toWindowsPathIfNeeded } from "./path-utils.js";
@@ -23,8 +23,13 @@ export interface PowerShellContext {
   scriptDirWindows: string;
 }
 
+const BRIDGE_TEMP_ROOT_NAME = "wsl-chrome-bridge-tmp";
+const POWERSHELL_TEMP_PREFIX = "wsl-chrome-bridge-ps-";
+
 export function createPowerShellContext(env: NodeJS.ProcessEnv = process.env): PowerShellContext {
-  const scriptDir = mkdtempSync(join(tmpdir(), "wsl-chrome-bridge-ps-"));
+  const tempRoot = join(tmpdir(), BRIDGE_TEMP_ROOT_NAME);
+  mkdirSync(tempRoot, { recursive: true });
+  const scriptDir = mkdtempSync(join(tempRoot, POWERSHELL_TEMP_PREFIX));
   const scriptDirWindows =
     toWindowsPathIfNeeded(scriptDir, { distroName: env.WSL_DISTRO_NAME }) ?? scriptDir;
 
