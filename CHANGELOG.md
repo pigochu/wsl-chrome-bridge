@@ -1,7 +1,7 @@
 wsl-chrome-bridge Change Log
 ============================
 
-0.2.0 2026
+0.2.0 2026-04-19
 -----------------
  - Added `WSL_CHROME_BRIDGE_DEBUG_FILE` env support to write bridge debug logs to a target file.
  - Added `WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT` env support to control the Windows Chrome debug port.
