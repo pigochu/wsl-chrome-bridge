@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_WINDOWS_USER_DATA_DIR,
   buildWindowsChromeArgs,
   parseBrowserPathFromWsUrl,
   planBridgeLaunch
@@ -87,8 +88,8 @@ describe("planBridgeLaunch", () => {
     expect(plan.requestedLocalDebugPort).toBeNull();
     expect(plan.localProxyPort).toBeNull();
     expect(plan.userDataDir).toBeNull();
-    expect(plan.windowsUserDataDir).toBeNull();
-    expect(plan.windowsUserDataDirSource).toBe("none");
+    expect(plan.windowsUserDataDir).toBe(DEFAULT_WINDOWS_USER_DATA_DIR);
+    expect(plan.windowsUserDataDirSource).toBe("default");
     expect(plan.createdUserDataDir).toBe(false);
     expect(plan.windowsDebugPortSource).toBe("auto-random");
     expect(plan.windowsDebugPort).toBeGreaterThanOrEqual(10000);
@@ -214,8 +215,8 @@ describe("planBridgeLaunch", () => {
 
     expect(plan.createdUserDataDir).toBe(false);
     expect(plan.userDataDir).toBe("/home/user/chrome-profile");
-    expect(plan.windowsUserDataDir).toBeNull();
-    expect(plan.windowsUserDataDirSource).toBe("none");
+    expect(plan.windowsUserDataDir).toBe(DEFAULT_WINDOWS_USER_DATA_DIR);
+    expect(plan.windowsUserDataDirSource).toBe("default");
     expect(plan.passthroughArgs).toContain("--disable-gpu");
   });
 
@@ -226,8 +227,8 @@ describe("planBridgeLaunch", () => {
 
     expect(plan.createdUserDataDir).toBe(false);
     expect(plan.userDataDir).toBe("/tmp/chrome-profile");
-    expect(plan.windowsUserDataDir).toBeNull();
-    expect(plan.windowsUserDataDirSource).toBe("none");
+    expect(plan.windowsUserDataDir).toBe(DEFAULT_WINDOWS_USER_DATA_DIR);
+    expect(plan.windowsUserDataDirSource).toBe("default");
     expect(plan.passthroughArgs).toContain("--disable-gpu");
   });
 
@@ -238,8 +239,8 @@ describe("planBridgeLaunch", () => {
 
     expect(plan.createdUserDataDir).toBe(false);
     expect(plan.userDataDir).toBe("/home/user/.cache/chrome-devtools-mcp/chrome-profile");
-    expect(plan.windowsUserDataDir).toBeNull();
-    expect(plan.windowsUserDataDirSource).toBe("none");
+    expect(plan.windowsUserDataDir).toBe(DEFAULT_WINDOWS_USER_DATA_DIR);
+    expect(plan.windowsUserDataDirSource).toBe("default");
   });
 
   it("restores path-resolved %TEMP% windows path from linux absolute prefix", () => {
@@ -281,7 +282,7 @@ describe("buildWindowsChromeArgs", () => {
     expect(windowsArgs).toContain("--remote-allow-origins=*");
   });
 
-  it("does not inject user-data-dir when resolved path is still linux-style", () => {
+  it("injects default user-data-dir when resolved path is still linux-style", () => {
     const plan = planBridgeLaunch([
       "--user-data-dir=/home/user/chrome-profile",
       "--remote-debugging-port=24444"
@@ -291,7 +292,7 @@ describe("buildWindowsChromeArgs", () => {
       WSL_DISTRO_NAME: "Ubuntu"
     });
 
-    expect(windowsArgs.find((x) => x.startsWith("--user-data-dir="))).toBeUndefined();
+    expect(windowsArgs).toContain(`--user-data-dir=${DEFAULT_WINDOWS_USER_DATA_DIR}`);
     expect(windowsArgs).toContain("--remote-debugging-port=24444");
   });
 

@@ -214,6 +214,14 @@ Bridge checks that local path and removes it only when it is an empty directory.
 
 Bridge only passes Windows-style user-data-dir values to Windows Chrome. Path-resolved forms like `/cwd/%TEMP%\\...` are restored back to the original Windows-style path when possible.
 
+If upstream does not send `--user-data-dir`, or the final value cannot be restored as a Windows-style path (and gets filtered), bridge automatically falls back to:
+
+```text
+%TEMP%\wsl-chrome-bridge\profile-default
+```
+
+This ensures Windows Chrome always starts with a usable profile directory and avoids launch behavior differences when no profile is provided.
+
 To avoid Playwright-specific differences and keep a unified config style across `chrome-devtools-mcp` and `playwright-mcp`, prefer setting:
 
 ```toml
@@ -225,6 +233,7 @@ WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx
 ## Important Argument Notes
 
 - `--user-data-dir` / `--userDataDir`: Bridge only forwards this flag when the final value is Windows-style (including restored `%TEMP%\\...` forms).
+- If `--user-data-dir` is missing or filtered (non-Windows-style), bridge falls back to `%TEMP%\\wsl-chrome-bridge\\profile-default`.
 - `playwright-mcp --browser chrome`: recommended for bridge usage to avoid upstream `--no-sandbox` banner in headed Chrome.
 
 ## Important Environment Variables

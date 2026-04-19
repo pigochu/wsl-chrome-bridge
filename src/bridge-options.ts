@@ -16,7 +16,7 @@ export interface BridgeLaunchPlan {
   /** User-data-dir value rewritten for Windows Chrome. */
   windowsUserDataDir: string | null;
   /** Source of the Windows user-data-dir decision. */
-  windowsUserDataDirSource: "arg" | "env" | "none";
+  windowsUserDataDirSource: "arg" | "env" | "default";
   /** Local proxy port requested by upstream (for example Playwright's random port). */
   requestedLocalDebugPort: number | null;
   /** Local websocket proxy port exposed by the bridge in WSL. */
@@ -43,6 +43,8 @@ const LOCAL_REMOTE_DEBUGGING_PORT_FLAGS = [
 ];
 const RANDOM_DEBUG_PORT_MIN = 10000;
 const RANDOM_DEBUG_PORT_MAX = 65535;
+/** Default Windows profile directory used when upstream does not provide a usable user-data-dir. */
+export const DEFAULT_WINDOWS_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\profile-default";
 
 function isWindowsPath(value: string): boolean {
   return (
@@ -313,7 +315,7 @@ export function planBridgeLaunch(
   const localProxyPort = requestedLocalDebugPort;
   let windowsDebugPortSource: BridgeLaunchPlan["windowsDebugPortSource"] = "auto-random";
   let windowsDebugPort = selectRandomDebugPort();
-  let windowsUserDataDirSource: BridgeLaunchPlan["windowsUserDataDirSource"] = "none";
+  let windowsUserDataDirSource: BridgeLaunchPlan["windowsUserDataDirSource"] = "default";
 
   if (bridgeRemoteDebugPort !== null) {
     windowsDebugPort = bridgeRemoteDebugPort;
@@ -331,6 +333,8 @@ export function planBridgeLaunch(
     windowsUserDataDirSource = "env";
   } else if (windowsUserDataDir) {
     windowsUserDataDirSource = "arg";
+  } else {
+    windowsUserDataDir = DEFAULT_WINDOWS_USER_DATA_DIR;
   }
 
   return {
