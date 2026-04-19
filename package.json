@@ -16,7 +16,9 @@
     "node": ">=20"
   },
   "files": [
-    "dist"
+    "dist",
+    "README*.md",
+    "UPGRADE*.md"
   ],
   "bin": {
     "wsl-chrome-bridge": "dist/main.js"
