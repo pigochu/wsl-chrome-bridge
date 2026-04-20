@@ -9,6 +9,8 @@ export interface BridgeLaunchPlan {
   usePipeTransport: boolean;
   /** Optional bridge debug log file path in WSL. */
   bridgeDebugFile: string | null;
+  /** Optional directory for writing one raw CDP payload file per message. */
+  bridgeDebugRawDir: string | null;
   /** Optional Chrome executable override from environment variable. */
   bridgeChromeExecutablePath: string | null;
   /** User-data-dir value as seen by the bridge (WSL side). */
@@ -133,6 +135,7 @@ export function planBridgeLaunch(
   let userDataDir: string | null = null;
   let windowsUserDataDir: string | null = null;
   let bridgeDebugFile: string | null = null;
+  let bridgeDebugRawDir: string | null = null;
   let bridgeChromeExecutablePath: string | null = null;
   let bridgeRemoteDebugPort: number | null = null;
   let requestedLocalDebugPort: number | null = null;
@@ -312,6 +315,11 @@ export function planBridgeLaunch(
     }
   }
 
+  const envDebugRawDir = env.WSL_CHROME_BRIDGE_DEBUG_RAW_DIR?.trim();
+  if (envDebugRawDir) {
+    bridgeDebugRawDir = envDebugRawDir;
+  }
+
   const localProxyPort = requestedLocalDebugPort;
   let windowsDebugPortSource: BridgeLaunchPlan["windowsDebugPortSource"] = "auto-random";
   let windowsDebugPort = selectRandomDebugPort();
@@ -342,6 +350,7 @@ export function planBridgeLaunch(
     passthroughArgs,
     usePipeTransport,
     bridgeDebugFile,
+    bridgeDebugRawDir,
     bridgeChromeExecutablePath,
     userDataDir,
     windowsUserDataDir,

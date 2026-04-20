@@ -143,6 +143,24 @@ describe("planBridgeLaunch", () => {
     expect(plan.bridgeDebugFile).toBeNull();
   });
 
+  it("uses WSL_CHROME_BRIDGE_DEBUG_RAW_DIR when provided", () => {
+    const plan = planBridgeLaunch(
+      ["--disable-gpu"],
+      { WSL_CHROME_BRIDGE_DEBUG_RAW_DIR: "/tmp/bridge-raw-logs" }
+    );
+
+    expect(plan.bridgeDebugRawDir).toBe("/tmp/bridge-raw-logs");
+  });
+
+  it("ignores empty WSL_CHROME_BRIDGE_DEBUG_RAW_DIR values", () => {
+    const plan = planBridgeLaunch(
+      ["--disable-gpu"],
+      { WSL_CHROME_BRIDGE_DEBUG_RAW_DIR: "   " }
+    );
+
+    expect(plan.bridgeDebugRawDir).toBeNull();
+  });
+
   it("rejects deprecated --bridge-chrome-executablePath flag", () => {
     expect(() =>
       planBridgeLaunch(["--bridge-chrome-executablePath=C:\\Custom\\Chrome\\chrome.exe"])

@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { once } from "node:events";
 import { createServer, type IncomingMessage } from "node:http";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { WebSocket, WebSocketServer } from "ws";
 import {
@@ -30,6 +30,43 @@ import {
 
 const POLL_INTERVAL_MS = 400;
 const CHROME_READY_TIMEOUT_MS = 30_000;
+const LARGE_CDP_STRING_BYTES = 16 * 1024;
+const MAX_TRACKED_REQUEST_METHODS = 100;
+type BridgeDebugLevel = "all" | "important";
+
+const IMPORTANT_CDP_METHODS = new Set<string>([
+  // Target/session lifecycle (most common failure points for attach/detach/disconnect)
+  "Target.setDiscoverTargets",
+  "Target.getTargets",
+  "Target.getTargetInfo",
+  "Target.getDevToolsTarget",
+  "Target.setAutoAttach",
+  "Target.autoAttachRelated",
+  "Target.attachToTarget",
+  "Target.attachedToTarget",
+  "Target.detachFromTarget",
+  "Target.detachedFromTarget",
+  "Target.targetCreated",
+  "Target.targetInfoChanged",
+  "Target.targetDestroyed",
+  "Target.activateTarget",
+  "Target.createTarget",
+  "Target.closeTarget",
+  // Browser/page open-close lifecycle
+  "Browser.getVersion",
+  "Browser.close",
+  "Page.navigate",
+  "Page.frameStartedLoading",
+  // Disconnection/error signals
+  "Inspector.detached",
+  "Runtime.exceptionThrown",
+  "Network.loadingFailed"
+]);
+
+const IMPORTANT_EXCLUDED_METHODS = new Set<string>([
+  // Common benign error during early-frame phases; noisy but usually not a disconnect root cause.
+  "Storage.getStorageKey"
+]);
 
 const LAUNCH_CHROME_PS = `
 param(
@@ -245,6 +282,127 @@ interface StartLocalDebugProxyOptions {
   onClientMessage: (message: string) => void;
 }
 
+type RelayMessageKind = "request" | "response" | "event" | "invalid-json" | "unknown";
+
+interface ParsedRelayMessage {
+  kind: RelayMessageKind;
+  id: string | number | null;
+  method: string | null;
+  hasError: boolean;
+  targetId: string | null;
+  browserContextId: string | null;
+  sessionId: string | null;
+}
+
+interface RenderedCdpMessage {
+  title: string;
+  payload: unknown;
+  parsed: ParsedRelayMessage;
+  canonicalMethod: string | null;
+}
+
+function cdpKindLabel(kind: RelayMessageKind): string {
+  switch (kind) {
+    case "request":
+      return "Request";
+    case "response":
+      return "Response";
+    case "event":
+      return "Event";
+    case "invalid-json":
+      return "InvalidJson";
+    case "unknown":
+      return "Unknown";
+  }
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return null;
+}
+
+function pickFirstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function parseRelayMessage(payload: string): ParsedRelayMessage {
+  try {
+    const parsed = JSON.parse(payload) as Record<string, unknown>;
+    const id =
+      typeof parsed.id === "number" || typeof parsed.id === "string" ? parsed.id : null;
+    const method = typeof parsed.method === "string" ? parsed.method : null;
+    const hasResult = Object.prototype.hasOwnProperty.call(parsed, "result");
+    const hasError = Object.prototype.hasOwnProperty.call(parsed, "error");
+    const paramsObj = asObject(parsed.params);
+    const resultObj = asObject(parsed.result);
+    const paramsTargetInfoObj = asObject(paramsObj?.targetInfo);
+    const resultTargetInfoObj = asObject(resultObj?.targetInfo);
+
+    const targetId = pickFirstString(
+      parsed.targetId,
+      paramsObj?.targetId,
+      paramsTargetInfoObj?.targetId,
+      resultObj?.targetId,
+      resultTargetInfoObj?.targetId
+    );
+    const browserContextId = pickFirstString(
+      parsed.browserContextId,
+      paramsObj?.browserContextId,
+      paramsTargetInfoObj?.browserContextId,
+      resultObj?.browserContextId,
+      resultTargetInfoObj?.browserContextId
+    );
+    const sessionId = pickFirstString(parsed.sessionId, paramsObj?.sessionId, resultObj?.sessionId);
+
+    if (method && id !== null) {
+      return { kind: "request", id, method, hasError: false, targetId, browserContextId, sessionId };
+    }
+    if (id !== null && (hasResult || hasError || !method)) {
+      return { kind: "response", id, method, hasError, targetId, browserContextId, sessionId };
+    }
+    if (method) {
+      return { kind: "event", id: null, method, hasError: false, targetId, browserContextId, sessionId };
+    }
+    return { kind: "unknown", id, method, hasError, targetId, browserContextId, sessionId };
+  } catch {
+    return {
+      kind: "invalid-json",
+      id: null,
+      method: null,
+      hasError: false,
+      targetId: null,
+      browserContextId: null,
+      sessionId: null
+    };
+  }
+}
+
+function toSafeRawTimestamp(iso: string): string {
+  return iso.replaceAll(":", "-").replaceAll(".", "-");
+}
+
+function normalizeDebugLevel(raw: string | undefined): BridgeDebugLevel {
+  const value = raw?.trim().toLowerCase();
+  if (!value || value === "important" || value === "important-only") {
+    return "important";
+  }
+  if (value === "all" || value === "full") {
+    return "all";
+  }
+  return "important";
+}
+
+function requestKey(id: string | number, sessionId: string | null): string {
+  return `${sessionId ?? "root"}::${String(id)}`;
+}
+
 function detectUpstreamHint(chromeArgs: string[]): "chrome-devtools-mcp" | "playwright-mcp" | "unknown" {
   const hasPipeMode = chromeArgs.includes("--remote-debugging-pipe");
   const hasRemoteDebugPort =
@@ -266,6 +424,8 @@ function collectBridgeEnvSnapshot(env: NodeJS.ProcessEnv): Record<string, string
   return {
     WSL_CHROME_BRIDGE_DEBUG: env.WSL_CHROME_BRIDGE_DEBUG ?? null,
     WSL_CHROME_BRIDGE_DEBUG_FILE: env.WSL_CHROME_BRIDGE_DEBUG_FILE ?? null,
+    WSL_CHROME_BRIDGE_DEBUG_LEVEL: env.WSL_CHROME_BRIDGE_DEBUG_LEVEL ?? null,
+    WSL_CHROME_BRIDGE_DEBUG_RAW_DIR: env.WSL_CHROME_BRIDGE_DEBUG_RAW_DIR ?? null,
     WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT: env.WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT ?? null,
     WSL_CHROME_BRIDGE_EXECUTABLE_PATH: env.WSL_CHROME_BRIDGE_EXECUTABLE_PATH ?? null,
     WSL_CHROME_BRIDGE_USER_DATA_DIR: env.WSL_CHROME_BRIDGE_USER_DATA_DIR ?? null,
@@ -418,7 +578,12 @@ export function createBridgeRunner() {
     const env = process.env;
     const debugFileFromEnv = env.WSL_CHROME_BRIDGE_DEBUG_FILE?.trim() || null;
     let activeDebugFile = debugFileFromEnv;
+    let activeRawDebugDir = env.WSL_CHROME_BRIDGE_DEBUG_RAW_DIR?.trim() || null;
+    const debugLevel = normalizeDebugLevel(env.WSL_CHROME_BRIDGE_DEBUG_LEVEL);
     const debug = env.WSL_CHROME_BRIDGE_DEBUG === "1" || Boolean(activeDebugFile);
+    const requestMethodById = new Map<string, string>();
+    let lastRawTimestamp = "";
+    let sameTimestampSequence = 0;
 
     const writeDebug = (message: string): void => {
       if (!debug) {
@@ -434,6 +599,161 @@ export function createBridgeRunner() {
           // keep running even if debug file write fails
         }
       }
+    };
+
+    const writeRawPayload = (payload: string): string | null => {
+      if (!activeRawDebugDir) {
+        return null;
+      }
+      try {
+        mkdirSync(activeRawDebugDir, { recursive: true });
+        const now = new Date();
+        const safeTimestamp = toSafeRawTimestamp(now.toISOString());
+        if (safeTimestamp === lastRawTimestamp) {
+          sameTimestampSequence += 1;
+        } else {
+          lastRawTimestamp = safeTimestamp;
+          sameTimestampSequence = 0;
+        }
+        const suffix =
+          sameTimestampSequence === 0 ? "" : `-${String(sameTimestampSequence).padStart(4, "0")}`;
+        const fileName = `raw-${safeTimestamp}${suffix}.log`;
+        const path = join(activeRawDebugDir, fileName);
+        writeFileSync(path, payload, "utf8");
+        return path;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeDebug(`rawPayloadWriteFailed dir=${activeRawDebugDir} error=${message}`);
+        return null;
+      }
+    };
+
+    const writeDebugBlock = (header: string, jsonPayload: unknown): void => {
+      if (!debug) {
+        return;
+      }
+      const timestamp = new Date().toISOString();
+      const body =
+        typeof jsonPayload === "string" ? jsonPayload : JSON.stringify(jsonPayload);
+      const block = `[${timestamp}] ${header}\n${body}\n\n`;
+      process.stderr.write(`[wsl-chrome-bridge][debug] ${header}\n${body}\n`);
+      if (activeDebugFile) {
+        try {
+          mkdirSync(dirname(activeDebugFile), { recursive: true });
+          appendFileSync(activeDebugFile, block, "utf8");
+        } catch {
+          // keep running even if debug file write fails
+        }
+      }
+    };
+
+    const replaceLargeStringFields = (value: unknown, path: string): unknown => {
+      if (typeof value === "string") {
+        if (Buffer.byteLength(value, "utf8") < LARGE_CDP_STRING_BYTES) {
+          return value;
+        }
+        const rawPath = writeRawPayload(value);
+        if (!rawPath) {
+          return value;
+        }
+        return {
+          __rawDataPath: rawPath,
+          __rawDataBytes: Buffer.byteLength(value, "utf8"),
+          __replacedField: path
+        };
+      }
+
+      if (Array.isArray(value)) {
+        return value.map((item, index) => replaceLargeStringFields(item, `${path}[${index}]`));
+      }
+
+      if (value && typeof value === "object") {
+        const record = value as Record<string, unknown>;
+        const replaced: Record<string, unknown> = {};
+        for (const [key, child] of Object.entries(record)) {
+          replaced[key] = replaceLargeStringFields(child, `${path}.${key}`);
+        }
+        return replaced;
+      }
+
+      return value;
+    };
+
+    const hopLabel = (hop: "upstream=>relay" | "relay=>chrome" | "chrome=>relay" | "relay=>upstream"): string => {
+      switch (hop) {
+        case "upstream=>relay":
+          return "upstream -> relay";
+        case "relay=>chrome":
+          return "relay -> chrome";
+        case "chrome=>relay":
+          return "chrome -> relay";
+        case "relay=>upstream":
+          return "relay -> upstream";
+      }
+    };
+
+    const renderCdpMessage = (payload: string): RenderedCdpMessage => {
+      const parsed = parseRelayMessage(payload);
+      let canonicalMethod = parsed.method;
+
+      if (parsed.kind === "request" && parsed.id !== null && parsed.method) {
+        if (requestMethodById.size >= MAX_TRACKED_REQUEST_METHODS) {
+          const oldest = requestMethodById.keys().next().value;
+          if (oldest) {
+            requestMethodById.delete(oldest);
+          }
+        }
+        requestMethodById.set(requestKey(parsed.id, parsed.sessionId), parsed.method);
+      }
+
+      if (!canonicalMethod && parsed.kind === "response" && parsed.id !== null) {
+        const key = requestKey(parsed.id, parsed.sessionId);
+        canonicalMethod = requestMethodById.get(key) ?? null;
+        requestMethodById.delete(key);
+      }
+
+      const title =
+        canonicalMethod ??
+        (parsed.kind === "response" && parsed.id !== null
+          ? `id=${parsed.id}`
+          : parsed.kind === "invalid-json"
+            ? "InvalidJSON"
+            : "UnknownMessage");
+
+      try {
+        const json = JSON.parse(payload) as unknown;
+        const replaced = replaceLargeStringFields(json, "$");
+        if (replaced && typeof replaced === "object" && !Array.isArray(replaced)) {
+          const asRecord = { ...(replaced as Record<string, unknown>) };
+          delete asRecord.method;
+          return { title, payload: asRecord, parsed, canonicalMethod };
+        }
+        return { title, payload: replaced, parsed, canonicalMethod };
+      } catch {
+        return { title, payload, parsed, canonicalMethod };
+      }
+    };
+
+    const isImportantRenderedMessage = (rendered: RenderedCdpMessage): boolean => {
+      const method = rendered.canonicalMethod;
+      if (method && IMPORTANT_EXCLUDED_METHODS.has(method)) {
+        return false;
+      }
+      if (rendered.parsed.hasError) {
+        return true;
+      }
+      return method !== null && IMPORTANT_CDP_METHODS.has(method);
+    };
+
+    const writeCdpHopLog = (
+      hop: "upstream=>relay" | "relay=>chrome" | "chrome=>relay" | "relay=>upstream",
+      rendered: RenderedCdpMessage
+    ): void => {
+      if (debugLevel === "important" && !isImportantRenderedMessage(rendered)) {
+        return;
+      }
+      const kind = cdpKindLabel(rendered.parsed.kind);
+      writeDebugBlock(`CDP(${hopLabel(hop)}) ${kind} ${rendered.title}`, rendered.payload);
     };
 
     if (activeDebugFile) {
@@ -482,9 +802,29 @@ export function createBridgeRunner() {
       }
     }
 
+    if (!activeRawDebugDir && plan.bridgeDebugRawDir) {
+      activeRawDebugDir = plan.bridgeDebugRawDir;
+    }
+
+    if (activeRawDebugDir) {
+      try {
+        mkdirSync(activeRawDebugDir, { recursive: true });
+        writeDebug(`rawDebugDir enabled path=${activeRawDebugDir}`);
+      } catch {
+        process.stderr.write(
+          `[wsl-chrome-bridge] failed to create raw debug dir: ${activeRawDebugDir}\n`
+        );
+        activeRawDebugDir = null;
+      }
+    } else {
+      writeDebug("rawDebugDir disabled");
+    }
+    writeDebug(`debugLevel=${debugLevel}`);
+
     writeDebug(`argv=${JSON.stringify(chromeArgs)}`);
     writeDebug(`launchPlan=${JSON.stringify({
       bridgeDebugFile: plan.bridgeDebugFile,
+      bridgeDebugRawDir: plan.bridgeDebugRawDir,
       bridgeChromeExecutablePath: plan.bridgeChromeExecutablePath,
       usePipeTransport: plan.usePipeTransport,
       userDataDir: plan.userDataDir,
@@ -720,10 +1060,13 @@ export function createBridgeRunner() {
           localVersionPayload,
           writeDebug,
           onClientMessage: (message) => {
+            const rendered = renderCdpMessage(message);
+            writeCdpHopLog("upstream=>relay", rendered);
             if (relayConnected) {
               relayChild.stdin.write(`${message}\n`);
+              writeCdpHopLog("relay=>chrome", rendered);
             } else {
-              queuedForRelay.push(message);
+              queuedForRelay.push({ message, rendered });
             }
           }
         });
@@ -756,7 +1099,10 @@ export function createBridgeRunner() {
     let relayStdoutBuffer = "";
     let relayStderrBuffer = "";
     let pendingFromPipe = Buffer.alloc(0);
-    const queuedForRelay: string[] = [];
+    const queuedForRelay: Array<{
+      message: string;
+      rendered: RenderedCdpMessage;
+    }> = [];
 
     let closed = false;
     const cleanup = async (code: number): Promise<number> => {
@@ -843,7 +1189,8 @@ export function createBridgeRunner() {
           if (line.includes("CONNECTED")) {
             relayConnected = true;
             for (const queued of queuedForRelay) {
-              relayChild.stdin.write(`${queued}\n`);
+              relayChild.stdin.write(`${queued.message}\n`);
+              writeCdpHopLog("relay=>chrome", queued.rendered);
             }
             queuedForRelay.length = 0;
             continue;
@@ -868,12 +1215,16 @@ export function createBridgeRunner() {
           if (!line) {
             continue;
           }
+          const rendered = renderCdpMessage(line);
+          writeCdpHopLog("chrome=>relay", rendered);
           if (pipeOut) {
             pipeOut.write(line);
             pipeOut.write("\0");
+            writeCdpHopLog("relay=>upstream", rendered);
           }
           if (localProxy) {
             localProxy.broadcast(line);
+            writeCdpHopLog("relay=>upstream", rendered);
           }
         }
       });
@@ -895,10 +1246,13 @@ export function createBridgeRunner() {
             if (!message) {
               continue;
             }
+            const rendered = renderCdpMessage(message);
+            writeCdpHopLog("upstream=>relay", rendered);
             if (relayConnected) {
               relayChild.stdin.write(`${message}\n`);
+              writeCdpHopLog("relay=>chrome", rendered);
             } else {
-              queuedForRelay.push(message);
+              queuedForRelay.push({ message, rendered });
             }
           }
         });

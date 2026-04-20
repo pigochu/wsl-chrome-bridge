@@ -243,6 +243,8 @@ WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx
 - `WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT=9222`: optional environment variable for Windows Chrome debug port. If no port is specified, bridge uses a random port instead of fixed `9222`.
 - Bridge now probes port availability on Windows before launching Chrome. In fixed-port mode, startup fails fast if that port is already occupied.
 - `WSL_CHROME_BRIDGE_DEBUG_FILE=/tmp/xxx.log`: optional debug output file in WSL.
+- `WSL_CHROME_BRIDGE_DEBUG_LEVEL=all|important`: optional debug verbosity level. `important` (default) logs only important session/navigation/disconnect-related CDP methods and error responses. `all` logs all CDP relay traffic.
+- `WSL_CHROME_BRIDGE_DEBUG_RAW_DIR=/tmp/wsl-chrome-bridge-raw`: optional directory to store full raw CDP payload files. Each request/response/event payload is written as a separate `raw-<timestamp>.log` file, and `WSL_CHROME_BRIDGE_DEBUG_FILE` includes the corresponding `rawPath` for each relay log entry.
 
 ### Known incompatible original arguments
 

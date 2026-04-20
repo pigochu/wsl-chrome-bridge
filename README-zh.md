@@ -243,6 +243,8 @@ WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx
 - `WSL_CHROME_BRIDGE_REMOTE_DEBUG_PORT=9222` : 以環境變數指定 Windows Chrome debug port。若都沒指定，bridge 改為隨機 port，不再固定 9222。
 - bridge 會在 Windows 端先探測 port 可用性。若是固定 port 模式且該 port 已被占用，會在啟動前直接報錯。
 - `WSL_CHROME_BRIDGE_DEBUG_FILE=/tmp/xxx.log` : 以環境變數指定 bridge debug log 輸出路徑。
+- `WSL_CHROME_BRIDGE_DEBUG_LEVEL=all|important` : 可選 debug 詳細度。`important`（預設）只記錄 session / 開頁導覽 / 斷線相關的重要 method 與錯誤回應；`all` 會記錄全部 CDP relay 訊息。
+- `WSL_CHROME_BRIDGE_DEBUG_RAW_DIR=/tmp/wsl-chrome-bridge-raw` : 以環境變數指定 raw CDP 內容輸出目錄。每筆 request/response/event 會獨立寫入一個 `raw-<timestamp>.log` 檔案，且 `WSL_CHROME_BRIDGE_DEBUG_FILE` 的 relay log 會包含對應的 `rawPath`。
 
 ### 已確認無法使用的參數
 
