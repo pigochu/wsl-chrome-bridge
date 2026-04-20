@@ -1,7 +1,7 @@
 wsl-chrome-bridge Change Log
 ============================
 
-0.2.1 2026-xx-xx
+0.2.1 under development
 -----------------
  - Added relay CDP logging with explicit hop direction and message type labels (`Request` / `Response` / `Event`).
  - Added `WSL_CHROME_BRIDGE_DEBUG_RAW_DIR` to store large raw CDP payload fragments while keeping main logs readable.
