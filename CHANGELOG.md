@@ -1,6 +1,15 @@
 wsl-chrome-bridge Change Log
 ============================
 
+0.2.1 2026-xx-xx
+-----------------
+ - Added relay CDP logging with explicit hop direction and message type labels (`Request` / `Response` / `Event`).
+ - Added `WSL_CHROME_BRIDGE_DEBUG_RAW_DIR` to store large raw CDP payload fragments while keeping main logs readable.
+ - Added `WSL_CHROME_BRIDGE_DEBUG_LEVEL` with `important` (default) and `all` modes for debug log volume control.
+ - Added focused filtering for important session/navigation/disconnect CDP methods, including request-response method correlation by `id` and `sessionId`.
+ - Added bounded request-method tracking (max 100 entries) and response-time cleanup to avoid unbounded memory growth.
+
+
 0.2.0 2026-04-19
 -----------------
  - Added `WSL_CHROME_BRIDGE_DEBUG_FILE` env support to write bridge debug logs to a target file.
