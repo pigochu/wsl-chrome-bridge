@@ -119,14 +119,6 @@ In bridge + system Chrome usage, `--browser chrome` helps avoid upstream `--no-s
 > See the FAQ for how to locate `--executablePath`.
 > For more configuration patterns, see `agent-config-sample/.codex/`.
 
-## Development Stack
-
-- Node 24
-- TypeScript v6
-- Commander v14
-- ws v8.20
-- Test framework: Vitest v4.1
-
 ## Build
 
 ```bash
@@ -189,6 +181,15 @@ If `DISPLAY` is not set, Playwright often switches to headless behavior (even wh
 
 That decision happens upstream before bridge logic starts, so `wsl-chrome-bridge` cannot override it later.  
 If you want to see a visible Chrome window on Windows, set `DISPLAY` in MCP `env` (for example `DISPLAY=:999`).
+
+### Headless vs headed behavior on upstream MCP exit
+
+`wsl-chrome-bridge` applies the following lifecycle policy when upstream MCP exits (for example `chrome-devtools-mcp` / `playwright-mcp`):
+
+- If Chrome was started in headless mode, bridge always terminates that Chrome process.
+- If Chrome was started in headed mode (non-headless), bridge always keeps that Chrome process.
+
+This behavior is intentional and can differ from native Playwright defaults in some workflows.
 
 ### Why Playwright may show `--no-sandbox` warning
 
@@ -253,3 +254,17 @@ The following original `chrome-devtools-mcp` option is currently known as incomp
 - `--browser-url`: this enables remote-connection mode in `chrome-devtools-mcp` instead of pipe mode, so it cannot work with `wsl-chrome-bridge`.
 
 > Other original `chrome-devtools-mcp` arguments are not all fully validated yet. This project is still under development, so only currently tested limitations are listed here.
+
+## For Developer
+
+Developer lifecycle and recovery reference:
+
+- [docs/BRIDGE_CONNECTION_LIFECYLE.md](./docs/BRIDGE_CONNECTION_LIFECYLE.md)
+
+Development stack:
+
+- Node 24
+- TypeScript v6
+- Commander v14
+- ws v8.20
+- Test framework: Vitest v4.1

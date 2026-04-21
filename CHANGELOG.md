@@ -1,7 +1,17 @@
 wsl-chrome-bridge Change Log
 ============================
 
-0.2.1 under development
+0.3.0 under development
+-----------------------
+ - Added Chrome instance reuse by matching `--user-data-dir` on Windows and reusing the matched instance `--remote-debugging-port` when available.
+ - Added runtime ownership model (`attached` / `launched`) and removed bridge-driven Chrome termination from cleanup to keep user Chrome sessions intact.
+ - Added `ws` degraded-state recovery flow: keep bridge alive after Chrome disconnect and recover on next upstream request.
+ - Added disconnect heuristics with weak/strong signals and a bounded weak-event cache (10 events, 2-second correlation window) to classify browser-level disconnects.
+ - Added recovery bootstrap via internal `Target.setAutoAttach` before queue flush, so upstream can receive fresh `Target.attachedToTarget` session events after reconnect.
+ - Added degraded-state short-circuit for `Browser.close` when Chrome is already known disconnected, returning a synthetic success response without relaunching Chrome.
+ - Improved relay diagnostics: enforced UTF-8 relay stdio and added structured exception logging (`hresult`, websocket/socket error codes, inner chain, stack top, socket state).
+
+0.2.1 2026-04-20 (This version was not published to npmjs)
 -----------------
  - Added relay CDP logging with explicit hop direction and message type labels (`Request` / `Response` / `Event`).
  - Added `WSL_CHROME_BRIDGE_DEBUG_RAW_DIR` to store large raw CDP payload fragments while keeping main logs readable.

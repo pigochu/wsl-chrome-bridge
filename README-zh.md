@@ -114,15 +114,6 @@ DISPLAY = ":9999"
 > FAQ 章節有介紹 `--executablePath` 的路徑尋找的方式。
 > 其他設定寫法可參考 `agent-config-sample/.codex/`。
 
-
-## 開發時所用的技術棧
-- Node 24
-- TypeScript v6
-- Commander v14
-- ws v8.20
-- 測試框架: Vitest v4.1
-
-
 ## 安裝與建置
 
 ```bash
@@ -186,6 +177,15 @@ ls -la ~/.local/share/mise/shims/wsl-chrome-bridge
 
 而這個判斷是在 bridge 之前就完成，所以 `wsl-chrome-bridge` 無法在後段覆蓋該決策。  
 如果你希望在 Windows 看到實際 Chrome 視窗，請於 MCP `env` 額外設定 `DISPLAY`（例如 `DISPLAY=:999`）。
+
+### 上游 MCP 結束時，Headless 與非 Headless 行為
+
+`wsl-chrome-bridge` 在上游 MCP（例如 `chrome-devtools-mcp` / `playwright-mcp`）結束時，採用以下生命週期策略：
+
+- 若 Chrome 是以 headless 啟動，bridge 一律會結束該 Chrome 行程。
+- 若 Chrome 不是以 headless 啟動（headed / non-headless），bridge 一律保留該 Chrome 行程。
+
+這是刻意設計的行為，與原生 Playwright 在部分流程下的預設行為可能不同。
 
 ### 為什麼 Playwright 可能出現 `--no-sandbox` 警告
 
@@ -254,3 +254,17 @@ WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx
 
 
 > 其他 `chrome-devtools-mcp` 提供的原始參數未必全部能使用，本程式尚在開發中，也沒有完全測試過所有原始參數，故只列出目前已經測試過的。
+
+## For Developer
+
+開發者可參考 bridge 連線生命週期與恢復策略文件：
+
+- [docs/BRIDGE_CONNECTION_LIFECYLE-zh.md](./docs/BRIDGE_CONNECTION_LIFECYLE-zh.md)
+
+開發時所用技術棧：
+
+- Node 24
+- TypeScript v6
+- Commander v14
+- ws v8.20
+- 測試框架: Vitest v4.1
