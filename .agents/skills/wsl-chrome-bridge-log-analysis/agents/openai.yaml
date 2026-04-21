@@ -1,0 +1,4 @@
+interface:
+  display_name: "WSL Bridge Log Analysis"
+  short_description: "Analyze wsl-chrome-bridge debug logs end-to-end"
+  default_prompt: "Use $wsl-chrome-bridge-log-analysis to analyze wsl-chrome-bridge debug logs and return likely root causes with line-number evidence."
