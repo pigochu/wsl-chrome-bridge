@@ -32,6 +32,9 @@ const POLL_INTERVAL_MS = 400;
 const CHROME_READY_TIMEOUT_MS = 30_000;
 const LARGE_CDP_STRING_BYTES = 16 * 1024;
 const MAX_TRACKED_REQUEST_METHODS = 100;
+const INTERNAL_CDP_REQUEST_ID_START = 900_000_000;
+const DISCONNECT_EVENT_BUFFER_LIMIT = 10;
+const DISCONNECT_EVENT_TIME_WINDOW_MS = 2_000;
 type BridgeDebugLevel = "all" | "important";
 
 const IMPORTANT_CDP_METHODS = new Set<string>([
@@ -76,19 +79,87 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $ChromeArgs = $ChromeArgs | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) }
-$userDataArg = $ChromeArgs | Where-Object { $_ -like "--user-data-dir=*" } | Select-Object -First 1
-if ($null -ne $userDataArg) {
-  $userDataDir = $userDataArg.Substring(16)
-  $escaped = [Regex]::Escape($userDataDir)
-  $existing = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object {
-    $null -ne $_.CommandLine -and $_.CommandLine -match ("--user-data-dir(=|\\s+)" + $escaped)
-  }
-  foreach ($proc in $existing) {
-    Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-  }
-}
 $proc = Start-Process -FilePath $ChromePath -ArgumentList $ChromeArgs -PassThru
 Write-Output $proc.Id
+`;
+
+const FIND_EXISTING_CHROME_PS = `
+param([string]$UserDataDir)
+$ErrorActionPreference = 'Stop'
+
+function Normalize-UserDataDir {
+  param([string]$Value)
+
+  if ([string]::IsNullOrWhiteSpace($Value)) {
+    return $null
+  }
+
+  $trimmed = $Value.Trim('"')
+  $expanded = [Environment]::ExpandEnvironmentVariables($trimmed)
+  try {
+    $resolved = (Resolve-Path -LiteralPath $expanded -ErrorAction Stop).Path
+  } catch {
+    $resolved = $expanded
+  }
+  return $resolved.ToLowerInvariant()
+}
+
+$target = Normalize-UserDataDir -Value $UserDataDir
+if ([string]::IsNullOrWhiteSpace($target)) {
+  Write-Output '{"found":false}'
+  exit 0
+}
+
+$matchUserDataPattern = '(?i)--user-data-dir(?:=|\\s+)(?:"([^"]+)"|([^\\s"]+))'
+$matchPortPattern = '(?i)--remote-debugging-port(?:=|\\s+)(\\d{1,5})'
+$candidates = @()
+
+$processes = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'"
+foreach ($proc in $processes) {
+  $line = $proc.CommandLine
+  if ([string]::IsNullOrWhiteSpace($line)) {
+    continue
+  }
+
+  $userDataMatch = [Regex]::Match($line, $matchUserDataPattern)
+  if (-not $userDataMatch.Success) {
+    continue
+  }
+
+  $capturedUserDataDir = if ($userDataMatch.Groups[1].Success) {
+    $userDataMatch.Groups[1].Value
+  } else {
+    $userDataMatch.Groups[2].Value
+  }
+
+  $normalizedUserDataDir = Normalize-UserDataDir -Value $capturedUserDataDir
+  if ([string]::IsNullOrWhiteSpace($normalizedUserDataDir) -or $normalizedUserDataDir -ne $target) {
+    continue
+  }
+
+  $portMatch = [Regex]::Match($line, $matchPortPattern)
+  if (-not $portMatch.Success) {
+    continue
+  }
+
+  $parsedPort = [int]$portMatch.Groups[1].Value
+  if ($parsedPort -lt 1 -or $parsedPort -gt 65535) {
+    continue
+  }
+
+  $candidates += [PSCustomObject]@{
+    pid = [int]$proc.ProcessId
+    port = $parsedPort
+  }
+}
+
+if ($candidates.Count -eq 0) {
+  Write-Output '{"found":false}'
+  exit 0
+}
+
+$selected = $candidates | Sort-Object -Property pid -Descending | Select-Object -First 1
+Write-Output ($selected | ConvertTo-Json -Compress -Depth 4)
 `;
 
 const GET_VERSION_PS = `
@@ -164,24 +235,130 @@ Write-Error "Unsupported mode: $Mode"
 exit 4
 `;
 
-const STOP_PROCESS_PS = `
-param([int]$Pid)
-$ErrorActionPreference = 'SilentlyContinue'
-Stop-Process -Id $Pid -Force
-`;
-
 const RELAY_CSHARP = String.raw`
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.WebSockets;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
 public class CDPRelay
 {
+    private static string EscapeForLog(string value)
+    {
+        return (value ?? string.Empty).Replace("\r", "\\r").Replace("\n", "\\n");
+    }
+
+    private static void AppendField(StringBuilder sb, string key, string value)
+    {
+        if (sb.Length > 0)
+        {
+            sb.Append(";");
+        }
+        sb.Append(key);
+        sb.Append("=");
+        sb.Append(EscapeForLog(value ?? string.Empty));
+    }
+
+    private static string BuildInnerChain(Exception ex)
+    {
+        if (ex == null)
+        {
+            return string.Empty;
+        }
+
+        var parts = new List<string>();
+        var current = ex;
+        var depth = 0;
+        while (current != null && depth < 5)
+        {
+            var type = current.GetType().FullName ?? current.GetType().Name;
+            var hresult = "0x" + current.HResult.ToString("X8");
+            var message = EscapeForLog(current.Message ?? string.Empty);
+            parts.Add(type + "|" + hresult + "|" + message);
+            current = current.InnerException;
+            depth += 1;
+        }
+
+        if (current != null)
+        {
+            parts.Add("truncated");
+        }
+
+        return string.Join(" -> ", parts.ToArray());
+    }
+
+    private static string StackTop(string stackTrace)
+    {
+        if (string.IsNullOrEmpty(stackTrace))
+        {
+            return string.Empty;
+        }
+
+        var normalized = stackTrace.Replace("\r", string.Empty);
+        var lines = normalized.Split('\n');
+        if (lines.Length == 0)
+        {
+            return string.Empty;
+        }
+        return lines[0].Trim();
+    }
+
+    private static string FormatSocketState(ClientWebSocket ws)
+    {
+        var sb = new StringBuilder();
+        AppendField(sb, "wsState", ws != null ? ws.State.ToString() : string.Empty);
+        if (ws != null)
+        {
+            AppendField(
+                sb,
+                "wsCloseStatus",
+                ws.CloseStatus.HasValue ? ws.CloseStatus.Value.ToString() : string.Empty
+            );
+            AppendField(sb, "wsCloseDescription", ws.CloseStatusDescription ?? string.Empty);
+        }
+        return sb.ToString();
+    }
+
+    private static string FormatException(Exception ex, ClientWebSocket ws)
+    {
+        var sb = new StringBuilder();
+        var type = ex.GetType().FullName ?? ex.GetType().Name;
+        AppendField(sb, "type", type);
+        AppendField(sb, "hresult", "0x" + ex.HResult.ToString("X8"));
+        AppendField(sb, "message", ex.Message ?? string.Empty);
+
+        var webSocketException = ex as WebSocketException;
+        if (webSocketException != null)
+        {
+            AppendField(sb, "webSocketErrorCode", webSocketException.WebSocketErrorCode.ToString());
+        }
+
+        var socketException = ex as SocketException;
+        if (socketException == null && ex.InnerException != null)
+        {
+            socketException = ex.InnerException as SocketException;
+        }
+        if (socketException != null)
+        {
+            AppendField(sb, "socketErrorCode", socketException.ErrorCode.ToString());
+            AppendField(sb, "socketError", socketException.SocketErrorCode.ToString());
+        }
+
+        AppendField(sb, "innerChain", BuildInnerChain(ex.InnerException));
+        AppendField(sb, "stackTop", StackTop(ex.StackTrace));
+        AppendField(sb, "socketContext", FormatSocketState(ws));
+        return sb.ToString();
+    }
+
     public static void Run(string wsUrl)
     {
+        Console.InputEncoding = new UTF8Encoding(false);
+        Console.OutputEncoding = new UTF8Encoding(false);
+
         var ws = new ClientWebSocket();
         ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(30);
         var cts = new CancellationTokenSource();
@@ -206,7 +383,12 @@ public class CDPRelay
                         {
                             var seg = new ArraySegment<byte>(buf);
                             recv = ws.ReceiveAsync(seg, token).GetAwaiter().GetResult();
-                            if (recv.MessageType == WebSocketMessageType.Close) return;
+                            if (recv.MessageType == WebSocketMessageType.Close)
+                            {
+                                Console.Error.WriteLine("READER_CLOSE:" + FormatSocketState(ws));
+                                Console.Error.Flush();
+                                return;
+                            }
                             sb.Append(Encoding.UTF8.GetString(buf, 0, recv.Count));
                         } while (!recv.EndOfMessage);
 
@@ -217,7 +399,7 @@ public class CDPRelay
                 catch (OperationCanceledException) { }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine("READER_ERROR:" + ex.Message);
+                    Console.Error.WriteLine("READER_ERROR:" + FormatException(ex, ws));
                     Console.Error.Flush();
                 }
             }, token);
@@ -236,7 +418,7 @@ public class CDPRelay
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine("FATAL:" + ex.Message);
+            Console.Error.WriteLine("FATAL:" + FormatException(ex, ws));
             Console.Error.Flush();
         }
         finally
@@ -258,6 +440,9 @@ public class CDPRelay
 const RELAY_PS = `
 param([string]$WsUrl)
 $ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 Add-Type -TypeDefinition @'
 ${RELAY_CSHARP}
 '@
@@ -299,6 +484,60 @@ interface RenderedCdpMessage {
   payload: unknown;
   parsed: ParsedRelayMessage;
   canonicalMethod: string | null;
+}
+
+interface ExistingChromeMatch {
+  port: number;
+  pid: number | null;
+}
+
+type WeakDisconnectSignal = "Inspector.detached" | "Target.detachedFromTarget";
+type StrongDisconnectSignal = "ConnectionClosedPrematurely" | "READER_CLOSE";
+type DisconnectSignal = WeakDisconnectSignal | StrongDisconnectSignal;
+
+interface CachedDisconnectEvent {
+  signal: WeakDisconnectSignal;
+  observedAtMs: number;
+  rawJson: string;
+}
+
+interface NearbyDisconnectEvent {
+  signal: WeakDisconnectSignal;
+  deltaMs: number;
+  rawJson: string;
+}
+
+interface DisconnectAssessment {
+  weakSignalSeen: boolean;
+  strongSignalSeen: boolean;
+  weakSignalWithinWindow: boolean;
+  chromeDisconnectedLikely: boolean;
+  summary: string;
+  nearbyWeakEventCount: number;
+  nearbyWeakEvents: NearbyDisconnectEvent[];
+}
+
+interface PendingInternalCdpRequest {
+  generation: number;
+  method: string;
+  purpose: "recovery-auto-attach";
+}
+
+const WEAK_DISCONNECT_SIGNALS = new Set<WeakDisconnectSignal>([
+  "Inspector.detached",
+  "Target.detachedFromTarget"
+]);
+const STRONG_DISCONNECT_SIGNALS = new Set<StrongDisconnectSignal>([
+  "ConnectionClosedPrematurely",
+  "READER_CLOSE"
+]);
+
+function isWeakDisconnectSignal(signal: DisconnectSignal): signal is WeakDisconnectSignal {
+  return signal === "Inspector.detached" || signal === "Target.detachedFromTarget";
+}
+
+function isStrongDisconnectSignal(signal: DisconnectSignal): signal is StrongDisconnectSignal {
+  return signal === "ConnectionClosedPrematurely" || signal === "READER_CLOSE";
 }
 
 function cdpKindLabel(kind: RelayMessageKind): string {
@@ -486,6 +725,119 @@ function hasPipeFds(): boolean {
   }
 }
 
+function parseExistingChromeMatch(raw: string): ExistingChromeMatch | null {
+  try {
+    const value = JSON.parse(raw.trim()) as Record<string, unknown>;
+    if (
+      value &&
+      Object.prototype.hasOwnProperty.call(value, "found") &&
+      value.found === false
+    ) {
+      return null;
+    }
+
+    const port = Number.parseInt(String(value.port), 10);
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
+      return null;
+    }
+
+    const pidRaw = value.pid;
+    const pid =
+      typeof pidRaw === "number" && Number.isFinite(pidRaw)
+        ? Math.trunc(pidRaw)
+        : Number.parseInt(String(pidRaw), 10);
+
+    return {
+      port,
+      pid: Number.isFinite(pid) ? pid : null
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseRelayField(line: string, field: string): string | null {
+  const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`(?:^|;)${escapedField}=([^;]*)`);
+  const match = line.match(pattern);
+  if (!match) {
+    return null;
+  }
+  return match[1] ?? null;
+}
+
+function detectStrongDisconnectSignalFromRelayLog(line: string): StrongDisconnectSignal | null {
+  if (line.startsWith("READER_CLOSE:")) {
+    return "READER_CLOSE";
+  }
+  if (!line.startsWith("READER_ERROR:")) {
+    return null;
+  }
+  const payload = line.slice("READER_ERROR:".length);
+  const webSocketErrorCode = parseRelayField(payload, "webSocketErrorCode");
+  if (webSocketErrorCode === "ConnectionClosedPrematurely") {
+    return "ConnectionClosedPrematurely";
+  }
+  return null;
+}
+
+function detectWeakDisconnectSignalFromCdp(rendered: RenderedCdpMessage): WeakDisconnectSignal | null {
+  if (rendered.parsed.kind !== "event" || !rendered.canonicalMethod) {
+    return null;
+  }
+  if (rendered.canonicalMethod === "Inspector.detached") {
+    return "Inspector.detached";
+  }
+  if (rendered.canonicalMethod === "Target.detachedFromTarget") {
+    return "Target.detachedFromTarget";
+  }
+  return null;
+}
+
+function assessDisconnectSignals(
+  signals: Set<DisconnectSignal>,
+  recentWeakEvents: CachedDisconnectEvent[],
+  disconnectAtMs: number,
+  windowMs: number
+): DisconnectAssessment {
+  let weakSignalSeen = false;
+  let strongSignalSeen = false;
+  for (const signal of signals) {
+    if (isWeakDisconnectSignal(signal) && WEAK_DISCONNECT_SIGNALS.has(signal)) {
+      weakSignalSeen = true;
+    }
+    if (isStrongDisconnectSignal(signal) && STRONG_DISCONNECT_SIGNALS.has(signal)) {
+      strongSignalSeen = true;
+    }
+  }
+
+  // We only treat weak disconnect events as actionable when they happen
+  // immediately before websocket interruption. This avoids stale-detach false positives.
+  const nearbyWeakEvents: NearbyDisconnectEvent[] = [];
+  for (const event of recentWeakEvents) {
+    const deltaMs = disconnectAtMs - event.observedAtMs;
+    if (deltaMs < 0 || deltaMs > windowMs) {
+      continue;
+    }
+    nearbyWeakEvents.push({
+      signal: event.signal,
+      deltaMs,
+      rawJson: event.rawJson
+    });
+  }
+
+  const weakSignalWithinWindow = nearbyWeakEvents.length > 0;
+  return {
+    weakSignalSeen,
+    strongSignalSeen,
+    weakSignalWithinWindow,
+    chromeDisconnectedLikely: weakSignalWithinWindow && strongSignalSeen,
+    summary: Array.from(signals).join(",") || "none",
+    nearbyWeakEventCount: nearbyWeakEvents.length,
+    nearbyWeakEvents
+  };
+}
+
 async function startLocalDebugProxy(
   options: StartLocalDebugProxyOptions
 ): Promise<LocalDebugProxyContext> {
@@ -582,6 +934,8 @@ export function createBridgeRunner() {
     const debugLevel = normalizeDebugLevel(env.WSL_CHROME_BRIDGE_DEBUG_LEVEL);
     const debug = env.WSL_CHROME_BRIDGE_DEBUG === "1" || Boolean(activeDebugFile);
     const requestMethodById = new Map<string, string>();
+    let internalCdpRequestId = INTERNAL_CDP_REQUEST_ID_START;
+    const pendingInternalCdpRequests = new Map<string, PendingInternalCdpRequest>();
     let lastRawTimestamp = "";
     let sameTimestampSequence = 0;
 
@@ -851,156 +1205,17 @@ export function createBridgeRunner() {
     writeDebug(`powershellPath=${powerShell.powershellPath}`);
 
     const launchScript = writePowerShellScript(powerShell, "launch-chrome.ps1", LAUNCH_CHROME_PS);
+    const findExistingChromeScript = writePowerShellScript(
+      powerShell,
+      "find-existing-chrome.ps1",
+      FIND_EXISTING_CHROME_PS
+    );
     const getVersionScript = writePowerShellScript(powerShell, "get-version.ps1", GET_VERSION_PS);
     const resolvePortScript = writePowerShellScript(powerShell, "resolve-port.ps1", RESOLVE_PORT_PS);
-    const stopProcessScript = writePowerShellScript(powerShell, "stop-process.ps1", STOP_PROCESS_PS);
     const relayScript = writePowerShellScript(powerShell, "relay.ps1", RELAY_PS);
     writeDebug(
-      `scripts={launch:${launchScript.windowsPath},version:${getVersionScript.windowsPath},resolvePort:${resolvePortScript.windowsPath},stop:${stopProcessScript.windowsPath},relay:${relayScript.windowsPath}}`
+      `scripts={launch:${launchScript.windowsPath},findExisting:${findExistingChromeScript.windowsPath},version:${getVersionScript.windowsPath},resolvePort:${resolvePortScript.windowsPath},relay:${relayScript.windowsPath}}`
     );
-
-    const resolvePortMode = plan.windowsDebugPortSource === "auto-random" ? "random" : "fixed";
-    const resolvePortResult = await runPowerShellFile(
-      powerShell,
-      resolvePortScript.windowsPath,
-      [String(plan.windowsDebugPort), resolvePortMode],
-      { timeoutMs: 8_000 }
-    );
-
-    if (resolvePortResult.code !== 0) {
-      writeDebug(
-        `resolvePortFailed mode=${resolvePortMode} requested=${plan.windowsDebugPort} code=${resolvePortResult.code} stdout=${resolvePortResult.stdout.trim()} stderr=${resolvePortResult.stderr.trim()}`
-      );
-      process.stderr.write(
-        "[wsl-chrome-bridge] failed to resolve an available Windows debug port: " +
-          `${resolvePortResult.stderr || resolvePortResult.stdout}\n`
-      );
-      destroyPowerShellContext(powerShell);
-      cleanupUserDataDirOnExit("resolvePortFailed");
-      return 1;
-    }
-
-    const resolvedWindowsDebugPort = Number.parseInt(resolvePortResult.stdout.trim(), 10);
-    if (!Number.isFinite(resolvedWindowsDebugPort)) {
-      writeDebug(
-        `resolvePortParseFailed raw=${resolvePortResult.stdout.trim()} stderr=${resolvePortResult.stderr.trim()}`
-      );
-      process.stderr.write(
-        "[wsl-chrome-bridge] failed to parse resolved Windows debug port from PowerShell output.\n"
-      );
-      destroyPowerShellContext(powerShell);
-      cleanupUserDataDirOnExit("resolvePortParseFailed");
-      return 1;
-    }
-    writeDebug(
-      `resolvedWindowsDebugPort=${resolvedWindowsDebugPort} source=${plan.windowsDebugPortSource} mode=${resolvePortMode}`
-    );
-
-    const planWithResolvedPort = {
-      ...plan,
-      windowsDebugPort: resolvedWindowsDebugPort
-    };
-
-    const chromePath = resolveChromeCommand({
-      env,
-      bridgeChromeExecutablePath: plan.bridgeChromeExecutablePath
-    });
-    const windowsArgs = buildWindowsChromeArgs(planWithResolvedPort, env);
-    writeDebug(`chromePath=${chromePath}`);
-    writeDebug(`windowsArgs=${JSON.stringify(windowsArgs)}`);
-
-    const launchResult = await runPowerShellFile(
-      powerShell,
-      launchScript.windowsPath,
-      [chromePath, ...windowsArgs],
-      { timeoutMs: 15_000 }
-    );
-
-    if (launchResult.code !== 0) {
-      writeDebug(`launchFailed code=${launchResult.code} stdout=${launchResult.stdout} stderr=${launchResult.stderr}`);
-      process.stderr.write(
-        `[wsl-chrome-bridge] failed to launch Windows Chrome: ${launchResult.stderr || launchResult.stdout}\n`
-      );
-      destroyPowerShellContext(powerShell);
-      cleanupUserDataDirOnExit("launchFailed");
-      return 1;
-    }
-    writeDebug(
-      `launchResult code=${launchResult.code} stdout=${launchResult.stdout.trim()} stderr=${launchResult.stderr.trim()}`
-    );
-
-    const chromePid = Number.parseInt(launchResult.stdout.trim(), 10);
-    if (!Number.isFinite(chromePid)) {
-      writeDebug(`invalidChromePid output=${launchResult.stdout}`);
-      process.stderr.write(
-        `[wsl-chrome-bridge] failed to parse Chrome PID from PowerShell output: ${launchResult.stdout}\n`
-      );
-      destroyPowerShellContext(powerShell);
-      cleanupUserDataDirOnExit("invalidChromePid");
-      return 1;
-    }
-
-    let remoteVersion: Record<string, unknown> | null = null;
-    const startAt = Date.now();
-    while (Date.now() - startAt < CHROME_READY_TIMEOUT_MS) {
-      const result = await runPowerShellFile(
-        powerShell,
-        getVersionScript.windowsPath,
-        [String(planWithResolvedPort.windowsDebugPort)],
-        { timeoutMs: 4_000 }
-      );
-
-      if (result.code === 0 && result.stdout.trim()) {
-        try {
-          remoteVersion = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
-          writeDebug(`remoteVersion=${JSON.stringify(remoteVersion)}`);
-          break;
-        } catch {
-          writeDebug(`remoteVersionParseFailed raw=${result.stdout.trim()}`);
-          // ignore malformed JSON and retry
-        }
-      } else if (debug) {
-        writeDebug(
-          `waitVersion retry code=${result.code} stdout=${result.stdout.trim()} stderr=${result.stderr.trim()}`
-        );
-      }
-      await sleep(POLL_INTERVAL_MS);
-    }
-
-    if (!remoteVersion || typeof remoteVersion.webSocketDebuggerUrl !== "string") {
-      writeDebug("chromeDebugWsNotReady");
-      process.stderr.write("[wsl-chrome-bridge] Chrome debug websocket was not ready in time.\n");
-      await runPowerShellFile(powerShell, stopProcessScript.windowsPath, [String(chromePid)], {
-        timeoutMs: 3_000
-      });
-      destroyPowerShellContext(powerShell);
-      cleanupUserDataDirOnExit("chromeDebugWsNotReady");
-      return 1;
-    }
-
-    const remoteBrowserWsUrl = remoteVersion.webSocketDebuggerUrl;
-    writeDebug(`remoteBrowserWsUrl=${remoteBrowserWsUrl}`);
-
-    const relayChild = spawn(
-      powerShell.powershellPath,
-      [
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        relayScript.windowsPath,
-        remoteBrowserWsUrl
-      ],
-      {
-        env,
-        stdio: ["pipe", "pipe", "pipe"]
-      }
-    );
-
-    relayChild.stdout.setEncoding("utf8");
-    relayChild.stderr.setEncoding("utf8");
 
     const usePipeTransport = plan.usePipeTransport && hasPipeFds();
     const useLocalProxyTransport = plan.localProxyPort !== null;
@@ -1012,9 +1227,6 @@ export function createBridgeRunner() {
       process.stderr.write(
         "[wsl-chrome-bridge] --remote-debugging-pipe was requested but OS pipe fds (3/4) are missing.\n"
       );
-      await runPowerShellFile(powerShell, stopProcessScript.windowsPath, [String(chromePid)], {
-        timeoutMs: 3_000
-      });
       destroyPowerShellContext(powerShell);
       cleanupUserDataDirOnExit("pipeFdsMissing");
       return 1;
@@ -1025,13 +1237,206 @@ export function createBridgeRunner() {
         "[wsl-chrome-bridge] missing transport channel. " +
           "Provide --remote-debugging-port (Playwright mode) or launch with OS pipes fd3/fd4.\n"
       );
-      await runPowerShellFile(powerShell, stopProcessScript.windowsPath, [String(chromePid)], {
-        timeoutMs: 3_000
-      });
       destroyPowerShellContext(powerShell);
       cleanupUserDataDirOnExit("missingTransportChannel");
       return 1;
     }
+
+    interface ChromeSession {
+      windowsDebugPort: number;
+      remoteVersion: Record<string, unknown>;
+      remoteBrowserWsUrl: string;
+      ownership: "attached" | "launched";
+    }
+
+    const waitForRemoteVersion = async (
+      windowsDebugPort: number,
+      phase: "startup" | "recovery"
+    ): Promise<Record<string, unknown> | null> => {
+      const startAt = Date.now();
+      while (Date.now() - startAt < CHROME_READY_TIMEOUT_MS) {
+        const result = await runPowerShellFile(
+          powerShell,
+          getVersionScript.windowsPath,
+          [String(windowsDebugPort)],
+          { timeoutMs: 4_000 }
+        );
+
+        if (result.code === 0 && result.stdout.trim()) {
+          try {
+            const version = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+            if (typeof version.webSocketDebuggerUrl === "string") {
+              writeDebug(
+                `remoteVersion phase=${phase} port=${windowsDebugPort} payload=${JSON.stringify(version)}`
+              );
+              return version;
+            }
+            writeDebug(
+              `remoteVersionMissingWs phase=${phase} port=${windowsDebugPort} payload=${result.stdout.trim()}`
+            );
+          } catch {
+            writeDebug(
+              `remoteVersionParseFailed phase=${phase} port=${windowsDebugPort} raw=${result.stdout.trim()}`
+            );
+          }
+        } else if (debug) {
+          writeDebug(
+            `waitVersion retry phase=${phase} port=${windowsDebugPort} code=${result.code} stdout=${result.stdout.trim()} stderr=${result.stderr.trim()}`
+          );
+        }
+        await sleep(POLL_INTERVAL_MS);
+      }
+      return null;
+    };
+
+    const tryReuseExistingChromeSession = async (
+      phase: "startup" | "recovery"
+    ): Promise<ChromeSession | null> => {
+      if (!plan.windowsUserDataDir) {
+        writeDebug(`existingChrome skip phase=${phase} reason=no-windows-user-data-dir`);
+        return null;
+      }
+
+      const existingResult = await runPowerShellFile(
+        powerShell,
+        findExistingChromeScript.windowsPath,
+        [plan.windowsUserDataDir],
+        { timeoutMs: 8_000 }
+      );
+
+      if (existingResult.code !== 0) {
+        writeDebug(
+          `existingChrome query failed phase=${phase} code=${existingResult.code} stdout=${existingResult.stdout.trim()} stderr=${existingResult.stderr.trim()}`
+        );
+        return null;
+      }
+
+      const existingMatch = parseExistingChromeMatch(existingResult.stdout);
+      if (!existingMatch) {
+        writeDebug(`existingChrome miss phase=${phase}`);
+        return null;
+      }
+
+      writeDebug(
+        `existingChrome hit phase=${phase} port=${existingMatch.port} pid=${existingMatch.pid ?? "unknown"}`
+      );
+      const version = await waitForRemoteVersion(existingMatch.port, phase);
+      if (!version || typeof version.webSocketDebuggerUrl !== "string") {
+        writeDebug(
+          `existingChrome stale phase=${phase} port=${existingMatch.port} pid=${existingMatch.pid ?? "unknown"}`
+        );
+        return null;
+      }
+
+      return {
+        windowsDebugPort: existingMatch.port,
+        remoteVersion: version,
+        remoteBrowserWsUrl: version.webSocketDebuggerUrl,
+        ownership: "attached"
+      };
+    };
+
+    const launchChromeSession = async (phase: "startup" | "recovery"): Promise<ChromeSession> => {
+      const resolvePortMode = plan.windowsDebugPortSource === "auto-random" ? "random" : "fixed";
+      const resolvePortResult = await runPowerShellFile(
+        powerShell,
+        resolvePortScript.windowsPath,
+        [String(plan.windowsDebugPort), resolvePortMode],
+        { timeoutMs: 8_000 }
+      );
+
+      if (resolvePortResult.code !== 0) {
+        throw new Error(
+          `failed to resolve an available Windows debug port: ${resolvePortResult.stderr || resolvePortResult.stdout}`
+        );
+      }
+
+      const resolvedWindowsDebugPort = Number.parseInt(resolvePortResult.stdout.trim(), 10);
+      if (!Number.isFinite(resolvedWindowsDebugPort)) {
+        throw new Error("failed to parse resolved Windows debug port from PowerShell output.");
+      }
+      writeDebug(
+        `resolvedWindowsDebugPort phase=${phase} port=${resolvedWindowsDebugPort} source=${plan.windowsDebugPortSource} mode=${resolvePortMode}`
+      );
+
+      const planWithResolvedPort = {
+        ...plan,
+        windowsDebugPort: resolvedWindowsDebugPort
+      };
+
+      const chromePath = resolveChromeCommand({
+        env,
+        bridgeChromeExecutablePath: plan.bridgeChromeExecutablePath
+      });
+      const windowsArgs = buildWindowsChromeArgs(planWithResolvedPort, env);
+      writeDebug(`chromePath phase=${phase} path=${chromePath}`);
+      writeDebug(`windowsArgs phase=${phase} args=${JSON.stringify(windowsArgs)}`);
+
+      const launchResult = await runPowerShellFile(
+        powerShell,
+        launchScript.windowsPath,
+        [chromePath, ...windowsArgs],
+        { timeoutMs: 15_000 }
+      );
+
+      if (launchResult.code !== 0) {
+        throw new Error(
+          `failed to launch Windows Chrome: ${launchResult.stderr || launchResult.stdout}`
+        );
+      }
+      writeDebug(
+        `launchResult phase=${phase} code=${launchResult.code} stdout=${launchResult.stdout.trim()} stderr=${launchResult.stderr.trim()}`
+      );
+
+      const launchedPid = Number.parseInt(launchResult.stdout.trim(), 10);
+      if (Number.isFinite(launchedPid)) {
+        writeDebug(`launchResult phase=${phase} pid=${launchedPid}`);
+      } else {
+        writeDebug(`launchResult phase=${phase} pid=unknown raw=${launchResult.stdout.trim()}`);
+      }
+
+      const version = await waitForRemoteVersion(resolvedWindowsDebugPort, phase);
+      if (!version || typeof version.webSocketDebuggerUrl !== "string") {
+        throw new Error("Chrome debug websocket was not ready in time.");
+      }
+
+      return {
+        windowsDebugPort: resolvedWindowsDebugPort,
+        remoteVersion: version,
+        remoteBrowserWsUrl: version.webSocketDebuggerUrl,
+        ownership: "launched"
+      };
+    };
+
+    const establishChromeSession = async (
+      phase: "startup" | "recovery"
+    ): Promise<ChromeSession> => {
+      const existing = await tryReuseExistingChromeSession(phase);
+      if (existing) {
+        return existing;
+      }
+      return await launchChromeSession(phase);
+    };
+
+    let startupSession: ChromeSession;
+    try {
+      startupSession = await establishChromeSession("startup");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      writeDebug(`startupSession failed message=${message}`);
+      process.stderr.write(`[wsl-chrome-bridge] ${message}\n`);
+      destroyPowerShellContext(powerShell);
+      cleanupUserDataDirOnExit("startupSessionFailed");
+      return 1;
+    }
+
+    let activeRemoteBrowserWsUrl = startupSession.remoteBrowserWsUrl;
+    let activeWindowsDebugPort = startupSession.windowsDebugPort;
+    let activeOwnership: "attached" | "launched" = startupSession.ownership;
+    const startupRemoteVersion = startupSession.remoteVersion;
+    writeDebug(
+      `startupSession established ownership=${activeOwnership} port=${activeWindowsDebugPort} ws=${activeRemoteBrowserWsUrl}`
+    );
 
     let pipeIn: ReturnType<typeof createReadStream> | null = null;
     let pipeOut: ReturnType<typeof createWriteStream> | null = null;
@@ -1040,16 +1445,20 @@ export function createBridgeRunner() {
       pipeOut = createWriteStream("", { fd: 4, autoClose: false });
     }
 
-    const remoteBrowserPath = parseBrowserPathFromWsUrl(remoteBrowserWsUrl);
+    const remoteBrowserPath = parseBrowserPathFromWsUrl(activeRemoteBrowserWsUrl);
     const localBrowserWsUrl =
       plan.localProxyPort === null
         ? null
         : `ws://127.0.0.1:${plan.localProxyPort}${remoteBrowserPath}`;
 
     let localProxy: LocalDebugProxyContext | null = null;
+    const earlyWsMessages: string[] = [];
+    let handleLocalProxyMessage: (message: string) => void = (message) => {
+      earlyWsMessages.push(message);
+    };
     if (plan.localProxyPort !== null && localBrowserWsUrl) {
       const localVersionPayload: Record<string, unknown> = {
-        ...remoteVersion,
+        ...startupRemoteVersion,
         webSocketDebuggerUrl: localBrowserWsUrl
       };
       try {
@@ -1060,14 +1469,7 @@ export function createBridgeRunner() {
           localVersionPayload,
           writeDebug,
           onClientMessage: (message) => {
-            const rendered = renderCdpMessage(message);
-            writeCdpHopLog("upstream=>relay", rendered);
-            if (relayConnected) {
-              relayChild.stdin.write(`${message}\n`);
-              writeCdpHopLog("relay=>chrome", rendered);
-            } else {
-              queuedForRelay.push({ message, rendered });
-            }
+            handleLocalProxyMessage(message);
           }
         });
         writeDebug(`localProxy listening ws=${localBrowserWsUrl}`);
@@ -1081,28 +1483,32 @@ export function createBridgeRunner() {
         process.stderr.write(
           `[wsl-chrome-bridge] failed to start local websocket proxy on 127.0.0.1:${plan.localProxyPort}: ${message}\n`
         );
-        try {
-          relayChild.kill("SIGTERM");
-        } catch {
-          // ignore
-        }
-        await runPowerShellFile(powerShell, stopProcessScript.windowsPath, [String(chromePid)], {
-          timeoutMs: 3_000
-        });
+        pipeIn?.destroy();
+        pipeOut?.destroy();
         destroyPowerShellContext(powerShell);
         cleanupUserDataDirOnExit("localProxyStartFailed");
         return 1;
       }
     }
 
+    type RelayState = "connecting" | "connected" | "degraded";
+    let relayState: RelayState = "connecting";
     let relayConnected = false;
     let relayStdoutBuffer = "";
     let relayStderrBuffer = "";
+    let relayGeneration = 0;
+    let relayChild: ReturnType<typeof spawn> | null = null;
     let pendingFromPipe = Buffer.alloc(0);
     const queuedForRelay: Array<{
       message: string;
       rendered: RenderedCdpMessage;
     }> = [];
+    let relayBootstrapPending = false;
+    let recoveryPromise: Promise<void> | null = null;
+    const disconnectSignals = new Set<DisconnectSignal>();
+    const recentWeakDisconnectEvents: CachedDisconnectEvent[] = [];
+    let strongDisconnectAtMs: number | null = null;
+    let latestDisconnectAssessment: DisconnectAssessment | null = null;
 
     let closed = false;
     const cleanup = async (code: number): Promise<number> => {
@@ -1120,22 +1526,21 @@ export function createBridgeRunner() {
         writeDebug("cleanup localProxy closed");
       }
 
-      try {
-        relayChild.stdin.end();
-      } catch {
-        // ignore
+      const child = relayChild;
+      relayChild = null;
+      if (child) {
+        try {
+          child.stdin?.end();
+        } catch {
+          // ignore
+        }
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // ignore
+        }
+        await Promise.race([once(child, "exit"), sleep(1_000)]);
       }
-      try {
-        relayChild.kill("SIGTERM");
-      } catch {
-        // ignore
-      }
-      await Promise.race([once(relayChild, "exit"), sleep(1_000)]);
-
-      await runPowerShellFile(powerShell, stopProcessScript.windowsPath, [String(chromePid)], {
-        timeoutMs: 3_000
-      });
-      writeDebug("cleanup stopProcess done");
 
       destroyPowerShellContext(powerShell);
       writeDebug("cleanup powershell context destroyed");
@@ -1150,6 +1555,7 @@ export function createBridgeRunner() {
 
     return await new Promise<number>((resolvePromise) => {
       let resolving = false;
+      let shuttingDown = false;
 
       const clear = () => {
         for (const [signal, handler] of signalHandlers) {
@@ -1162,9 +1568,483 @@ export function createBridgeRunner() {
           return;
         }
         resolving = true;
+        shuttingDown = true;
         clear();
         void cleanup(code).then(resolvePromise);
       };
+
+      const noteDisconnectSignal = (signal: DisconnectSignal, source: string): void => {
+        if (disconnectSignals.has(signal)) {
+          return;
+        }
+        disconnectSignals.add(signal);
+        writeDebug(`disconnectSignal observed signal=${signal} source=${source}`);
+      };
+
+      const rememberWeakDisconnectEvent = (
+        signal: WeakDisconnectSignal,
+        rawJson: string,
+        observedAtMs: number
+      ): void => {
+        recentWeakDisconnectEvents.push({ signal, rawJson, observedAtMs });
+        if (recentWeakDisconnectEvents.length > DISCONNECT_EVENT_BUFFER_LIMIT) {
+          recentWeakDisconnectEvents.splice(
+            0,
+            recentWeakDisconnectEvents.length - DISCONNECT_EVENT_BUFFER_LIMIT
+          );
+        }
+        writeDebug(
+          `disconnectEvent cached signal=${signal} cacheSize=${recentWeakDisconnectEvents.length}`
+        );
+      };
+
+      const writeDisconnectAssessment = (
+        trigger: string,
+        disconnectAtMs?: number
+      ): DisconnectAssessment => {
+        const effectiveDisconnectAtMs =
+          strongDisconnectAtMs ?? disconnectAtMs ?? Date.now();
+        const assessment = assessDisconnectSignals(
+          disconnectSignals,
+          recentWeakDisconnectEvents,
+          effectiveDisconnectAtMs,
+          DISCONNECT_EVENT_TIME_WINDOW_MS
+        );
+        writeDebug(
+          `disconnectAssessment trigger=${trigger} weakSignalSeen=${assessment.weakSignalSeen} strongSignalSeen=${assessment.strongSignalSeen} weakSignalWithinWindow=${assessment.weakSignalWithinWindow} windowMs=${DISCONNECT_EVENT_TIME_WINDOW_MS} disconnectAtMs=${effectiveDisconnectAtMs} chromeDisconnectedLikely=${assessment.chromeDisconnectedLikely} nearbyWeakEventCount=${assessment.nearbyWeakEventCount} disconnectSignals=${assessment.summary}`
+        );
+        if (assessment.nearbyWeakEvents.length > 0) {
+          writeDebugBlock(
+            `disconnectAssessment nearbyWeakEvents trigger=${trigger}`,
+            assessment.nearbyWeakEvents
+          );
+        }
+        return assessment;
+      };
+
+      const markRelayState = (
+        nextState: RelayState,
+        reason: string,
+        disconnectAssessment: DisconnectAssessment | null = null
+      ): void => {
+        if (nextState !== "degraded") {
+          latestDisconnectAssessment = null;
+        } else if (disconnectAssessment) {
+          latestDisconnectAssessment = disconnectAssessment;
+        }
+        if (relayState === nextState) {
+          writeDebug(`relayState unchanged state=${nextState} reason=${reason}`);
+          return;
+        }
+        relayState = nextState;
+        const assessmentSuffix = disconnectAssessment
+          ? ` disconnectSignals=${disconnectAssessment.summary} weakSignalWithinWindow=${disconnectAssessment.weakSignalWithinWindow} nearbyWeakEventCount=${disconnectAssessment.nearbyWeakEventCount} chromeDisconnectedLikely=${disconnectAssessment.chromeDisconnectedLikely}`
+          : "";
+	        writeDebug(
+	          `relayState changed state=${relayState} reason=${reason} port=${activeWindowsDebugPort} ownership=${activeOwnership}${assessmentSuffix}`
+	        );
+	      };
+
+	      const nextInternalCdpRequestId = (): number => {
+	        internalCdpRequestId += 1;
+	        return internalCdpRequestId;
+	      };
+
+	      const sendRecoveryAutoAttachBootstrap = (
+	        child: ReturnType<typeof spawn>,
+	        generation: number
+	      ): boolean => {
+	        if (!child.stdin) {
+	          return false;
+	        }
+	        const payload = {
+	          id: nextInternalCdpRequestId(),
+	          method: "Target.setAutoAttach",
+	          params: {
+	            autoAttach: true,
+	            waitForDebuggerOnStart: true,
+	            flatten: true
+	          }
+	        };
+	        const message = JSON.stringify(payload);
+	        const rendered = renderCdpMessage(message);
+	        pendingInternalCdpRequests.set(requestKey(payload.id, null), {
+	          generation,
+	          method: payload.method,
+	          purpose: "recovery-auto-attach"
+	        });
+	        writeDebugBlock("CDP(bridge-internal -> chrome) Request Target.setAutoAttach", rendered.payload);
+	        child.stdin.write(`${message}\n`);
+	        return true;
+	      };
+
+	      const tryHandleInternalCdpResponse = (
+	        generation: number,
+	        rendered: RenderedCdpMessage,
+	        child: ReturnType<typeof spawn>
+	      ): boolean => {
+	        if (rendered.parsed.kind !== "response" || rendered.parsed.id === null) {
+	          return false;
+	        }
+	        const key = requestKey(rendered.parsed.id, rendered.parsed.sessionId);
+	        const pending = pendingInternalCdpRequests.get(key);
+	        if (!pending) {
+	          return false;
+	        }
+	        pendingInternalCdpRequests.delete(key);
+	        writeDebugBlock(
+	          `CDP(chrome -> bridge-internal) Response ${pending.method}`,
+	          rendered.payload
+	        );
+	        if (pending.generation !== generation) {
+	          return true;
+	        }
+	        if (pending.purpose === "recovery-auto-attach") {
+	          relayBootstrapPending = false;
+	          if (rendered.parsed.hasError) {
+	            relayConnected = false;
+	            const assessment = writeDisconnectAssessment("recoveryBootstrapAutoAttachError");
+	            markRelayState("degraded", "recoveryBootstrapAutoAttachError", assessment);
+	            try {
+	              child.kill("SIGTERM");
+	            } catch {
+	              // ignore
+	            }
+	            maybeRecoverRelayForWs();
+	            return true;
+	          }
+	          writeDebug("recoveryBootstrap autoAttach acknowledged");
+	          flushQueuedForRelay();
+	        }
+	        return true;
+	      };
+
+      const flushQueuedForRelay = (): void => {
+        if (!relayChild || !relayConnected || !relayChild.stdin || relayBootstrapPending) {
+          return;
+        }
+        const relayStdin = relayChild.stdin;
+        while (queuedForRelay.length > 0) {
+          const queued = queuedForRelay.shift();
+          if (!queued) {
+            break;
+          }
+          relayStdin.write(`${queued.message}\n`);
+          writeCdpHopLog("relay=>chrome", queued.rendered);
+        }
+      };
+
+      const forwardToUpstream = (message: string, rendered: RenderedCdpMessage): void => {
+        if (pipeOut) {
+          pipeOut.write(message);
+          pipeOut.write("\0");
+          writeCdpHopLog("relay=>upstream", rendered);
+        }
+        if (localProxy) {
+          localProxy.broadcast(message);
+          writeCdpHopLog("relay=>upstream", rendered);
+        }
+      };
+
+      const sendToRelayOrQueue = (message: string, rendered: RenderedCdpMessage): void => {
+        if (
+          relayState === "connected" &&
+          relayChild &&
+          relayConnected &&
+	          relayChild.stdin &&
+	          !relayBootstrapPending
+	        ) {
+	          relayChild.stdin.write(`${message}\n`);
+	          writeCdpHopLog("relay=>chrome", rendered);
+	          return;
+        }
+        queuedForRelay.push({ message, rendered });
+      };
+
+      const startRelay = (remoteBrowserWsUrl: string, reason: string): void => {
+        if (shuttingDown) {
+          writeDebug(`startRelay skipped reason=shuttingDown trigger=${reason}`);
+          return;
+        }
+        disconnectSignals.clear();
+	        recentWeakDisconnectEvents.length = 0;
+	        strongDisconnectAtMs = null;
+	        relayBootstrapPending = false;
+	        pendingInternalCdpRequests.clear();
+	        relayGeneration += 1;
+	        const generation = relayGeneration;
+	        markRelayState("connecting", reason);
+        relayConnected = false;
+        relayStdoutBuffer = "";
+        relayStderrBuffer = "";
+
+        const previousRelayChild = relayChild;
+        const child = spawn(
+          powerShell.powershellPath,
+          [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            relayScript.windowsPath,
+            remoteBrowserWsUrl
+          ],
+          {
+            env,
+            stdio: ["pipe", "pipe", "pipe"]
+          }
+        );
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        relayChild = child;
+
+        if (previousRelayChild) {
+          try {
+            previousRelayChild.stdin?.end();
+          } catch {
+            // ignore
+          }
+          try {
+            previousRelayChild.kill("SIGTERM");
+          } catch {
+            // ignore
+          }
+        }
+
+        child.stderr.on("data", (chunk: string) => {
+          if (generation !== relayGeneration) {
+            return;
+          }
+          relayStderrBuffer += chunk;
+          while (true) {
+            const newlineIndex = relayStderrBuffer.indexOf("\n");
+            if (newlineIndex === -1) {
+              break;
+            }
+            const rawLine = relayStderrBuffer.slice(0, newlineIndex);
+            relayStderrBuffer = relayStderrBuffer.slice(newlineIndex + 1);
+            const line = rawLine.replace(/\r$/, "");
+            if (!line) {
+              continue;
+            }
+            writeDebug(`relayStderr ${line}`);
+            const strongDisconnectSignal = detectStrongDisconnectSignalFromRelayLog(line);
+            if (strongDisconnectSignal) {
+              noteDisconnectSignal(strongDisconnectSignal, "relayStderr");
+              const observedAtMs = Date.now();
+              strongDisconnectAtMs = observedAtMs;
+              relayConnected = false;
+              const assessment = writeDisconnectAssessment(
+                `relayStrongDisconnect:${strongDisconnectSignal}`,
+                observedAtMs
+              );
+	              if (usePipeTransport) {
+	                finalize(1);
+	              } else {
+	                relayBootstrapPending = false;
+	                markRelayState(
+	                  "degraded",
+	                  `relayStrongDisconnect:${strongDisconnectSignal}`,
+                  assessment
+                );
+                try {
+                  child.kill("SIGTERM");
+                } catch {
+                  // ignore
+                }
+              }
+              return;
+            }
+	            if (line.includes("CONNECTED")) {
+	              relayConnected = true;
+	              markRelayState("connected", "relayConnected");
+	              if (!usePipeTransport && reason === "recovery") {
+	                relayBootstrapPending = true;
+	                const sent = sendRecoveryAutoAttachBootstrap(child, generation);
+	                if (!sent) {
+	                  relayBootstrapPending = false;
+	                  relayConnected = false;
+	                  const assessment = writeDisconnectAssessment("recoveryBootstrapSendFailed");
+	                  markRelayState("degraded", "recoveryBootstrapSendFailed", assessment);
+	                  try {
+	                    child.kill("SIGTERM");
+	                  } catch {
+	                    // ignore
+	                  }
+	                  maybeRecoverRelayForWs();
+	                  return;
+	                }
+	                continue;
+	              }
+	              flushQueuedForRelay();
+	              continue;
+	            }
+	            if (line.startsWith("FATAL:")) {
+	              const assessment = writeDisconnectAssessment(`relayFatal:${line}`);
+	              if (usePipeTransport) {
+	                finalize(1);
+	              } else {
+	                relayConnected = false;
+	                relayBootstrapPending = false;
+	                markRelayState("degraded", `relayFatal:${line}`, assessment);
+	              }
+	              return;
+            }
+          }
+        });
+
+        child.stdout.on("data", (chunk: string) => {
+          if (generation !== relayGeneration) {
+            return;
+          }
+          relayStdoutBuffer += chunk;
+          while (true) {
+            const newlineIndex = relayStdoutBuffer.indexOf("\n");
+            if (newlineIndex === -1) {
+              break;
+            }
+            const rawLine = relayStdoutBuffer.slice(0, newlineIndex);
+            relayStdoutBuffer = relayStdoutBuffer.slice(newlineIndex + 1);
+	            const line = rawLine.replace(/\r$/, "");
+	            if (!line) {
+	              continue;
+	            }
+	            const rendered = renderCdpMessage(line);
+	            if (tryHandleInternalCdpResponse(generation, rendered, child)) {
+	              continue;
+	            }
+	            const weakDisconnectSignal = detectWeakDisconnectSignalFromCdp(rendered);
+	            if (weakDisconnectSignal) {
+	              noteDisconnectSignal(weakDisconnectSignal, "chromeEvent");
+              rememberWeakDisconnectEvent(weakDisconnectSignal, line, Date.now());
+            }
+            writeCdpHopLog("chrome=>relay", rendered);
+            forwardToUpstream(line, rendered);
+          }
+        });
+
+        child.once("error", () => {
+	          if (generation !== relayGeneration) {
+	            return;
+	          }
+	          relayConnected = false;
+	          relayBootstrapPending = false;
+	          const assessment = writeDisconnectAssessment("relayError");
+	          if (usePipeTransport) {
+	            finalize(1);
+          } else {
+            markRelayState("degraded", "relayError", assessment);
+          }
+        });
+
+        child.once("exit", (code) => {
+	          if (generation !== relayGeneration) {
+	            return;
+	          }
+	          relayConnected = false;
+	          relayBootstrapPending = false;
+	          relayChild = null;
+	          const assessment = writeDisconnectAssessment(`relayExit:${code ?? "null"}`);
+          if (usePipeTransport) {
+            finalize(code === 0 ? 0 : 1);
+            return;
+          }
+          markRelayState("degraded", `relayExit:${code ?? "null"}`, assessment);
+        });
+      };
+
+      const maybeRecoverRelayForWs = (): void => {
+        if (usePipeTransport || relayState !== "degraded") {
+          return;
+        }
+        if (shuttingDown || closed || resolving) {
+          writeDebug("recovery skipped reason=shuttingDown");
+          return;
+        }
+        if (recoveryPromise) {
+          return;
+        }
+
+        recoveryPromise = (async () => {
+          writeDebug("recovery start trigger=upstreamRequest");
+          const recoverySession = await establishChromeSession("recovery");
+          activeRemoteBrowserWsUrl = recoverySession.remoteBrowserWsUrl;
+          activeWindowsDebugPort = recoverySession.windowsDebugPort;
+          activeOwnership = recoverySession.ownership;
+          writeDebug(
+            `recovery success ownership=${activeOwnership} port=${activeWindowsDebugPort} ws=${activeRemoteBrowserWsUrl}`
+          );
+          startRelay(activeRemoteBrowserWsUrl, "recovery");
+        })()
+          .catch((error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            writeDebug(`recovery failed message=${message}`);
+            process.stderr.write(`[wsl-chrome-bridge] recovery failed: ${message}\n`);
+            finalize(1);
+          })
+          .finally(() => {
+            recoveryPromise = null;
+          });
+      };
+
+      const processUpstreamMessage = (message: string): void => {
+        if (shuttingDown || closed || resolving) {
+          writeDebug("upstream message ignored reason=shuttingDown");
+          return;
+        }
+        const rendered = renderCdpMessage(message);
+        writeCdpHopLog("upstream=>relay", rendered);
+        const shouldShortCircuitKnownClosedBrowserClose =
+          !usePipeTransport &&
+          relayState !== "connected" &&
+          rendered.parsed.kind === "request" &&
+          rendered.canonicalMethod === "Browser.close" &&
+          rendered.parsed.id !== null &&
+          Boolean(latestDisconnectAssessment?.chromeDisconnectedLikely);
+        if (shouldShortCircuitKnownClosedBrowserClose) {
+          const syntheticResponse: Record<string, unknown> = {
+            id: rendered.parsed.id,
+            result: {}
+          };
+          if (rendered.parsed.sessionId) {
+            syntheticResponse.sessionId = rendered.parsed.sessionId;
+          }
+          const syntheticMessage = JSON.stringify(syntheticResponse);
+          const syntheticRendered = renderCdpMessage(syntheticMessage);
+          writeDebug(
+            `shortCircuit Browser.close reason=chromeAlreadyClosed relayState=${relayState} id=${String(rendered.parsed.id)} session=${rendered.parsed.sessionId ?? "root"}`
+          );
+          forwardToUpstream(syntheticMessage, syntheticRendered);
+          return;
+        }
+        if (!usePipeTransport && relayState === "degraded") {
+          maybeRecoverRelayForWs();
+          sendToRelayOrQueue(message, rendered);
+          return;
+        }
+        if (!usePipeTransport && relayState === "connecting") {
+          sendToRelayOrQueue(message, rendered);
+          return;
+        }
+        if (!usePipeTransport && (!relayConnected || relayState !== "connected")) {
+          const assessment = writeDisconnectAssessment("upstreamWhileRelayUnavailable");
+          markRelayState("degraded", "upstreamWhileRelayUnavailable", assessment);
+          maybeRecoverRelayForWs();
+          sendToRelayOrQueue(message, rendered);
+          return;
+        }
+        sendToRelayOrQueue(message, rendered);
+      };
+
+      handleLocalProxyMessage = (message: string) => {
+        processUpstreamMessage(message);
+      };
+      for (const earlyMessage of earlyWsMessages) {
+        processUpstreamMessage(earlyMessage);
+      }
+      earlyWsMessages.length = 0;
 
       for (const signal of signals) {
         const handler = () => finalize(0);
@@ -1172,65 +2052,7 @@ export function createBridgeRunner() {
         process.on(signal, handler);
       }
 
-      relayChild.stderr.on("data", (chunk: string) => {
-        relayStderrBuffer += chunk;
-        while (true) {
-          const newlineIndex = relayStderrBuffer.indexOf("\n");
-          if (newlineIndex === -1) {
-            break;
-          }
-          const rawLine = relayStderrBuffer.slice(0, newlineIndex);
-          relayStderrBuffer = relayStderrBuffer.slice(newlineIndex + 1);
-          const line = rawLine.replace(/\r$/, "");
-          if (!line) {
-            continue;
-          }
-          writeDebug(`relayStderr ${line}`);
-          if (line.includes("CONNECTED")) {
-            relayConnected = true;
-            for (const queued of queuedForRelay) {
-              relayChild.stdin.write(`${queued.message}\n`);
-              writeCdpHopLog("relay=>chrome", queued.rendered);
-            }
-            queuedForRelay.length = 0;
-            continue;
-          }
-          if (line.startsWith("FATAL:")) {
-            finalize(1);
-            return;
-          }
-        }
-      });
-
-      relayChild.stdout.on("data", (chunk: string) => {
-        relayStdoutBuffer += chunk;
-        while (true) {
-          const newlineIndex = relayStdoutBuffer.indexOf("\n");
-          if (newlineIndex === -1) {
-            break;
-          }
-          const rawLine = relayStdoutBuffer.slice(0, newlineIndex);
-          relayStdoutBuffer = relayStdoutBuffer.slice(newlineIndex + 1);
-          const line = rawLine.replace(/\r$/, "");
-          if (!line) {
-            continue;
-          }
-          const rendered = renderCdpMessage(line);
-          writeCdpHopLog("chrome=>relay", rendered);
-          if (pipeOut) {
-            pipeOut.write(line);
-            pipeOut.write("\0");
-            writeCdpHopLog("relay=>upstream", rendered);
-          }
-          if (localProxy) {
-            localProxy.broadcast(line);
-            writeCdpHopLog("relay=>upstream", rendered);
-          }
-        }
-      });
-
-      relayChild.once("error", () => finalize(1));
-      relayChild.once("exit", (code) => finalize(code === 0 ? 0 : 1));
+      startRelay(activeRemoteBrowserWsUrl, "initial");
 
       if (pipeIn) {
         pipeIn.on("data", (chunk: Buffer | string) => {
@@ -1246,14 +2068,7 @@ export function createBridgeRunner() {
             if (!message) {
               continue;
             }
-            const rendered = renderCdpMessage(message);
-            writeCdpHopLog("upstream=>relay", rendered);
-            if (relayConnected) {
-              relayChild.stdin.write(`${message}\n`);
-              writeCdpHopLog("relay=>chrome", rendered);
-            } else {
-              queuedForRelay.push({ message, rendered });
-            }
+            processUpstreamMessage(message);
           }
         });
 
