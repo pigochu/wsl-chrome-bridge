@@ -259,7 +259,7 @@ WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx
 
 開發者可參考 bridge 連線生命週期與恢復策略文件：
 
-- [docs/BRIDGE_CONNECTION_LIFECYLE-zh.md](./docs/BRIDGE_CONNECTION_LIFECYLE-zh.md)
+- [docs/BRIDGE_CONNECTION_LIFECYCLE-zh.md](./docs/BRIDGE_CONNECTION_LIFECYCLE-zh.md)
 
 開發時所用技術棧：
 

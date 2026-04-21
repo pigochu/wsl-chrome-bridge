@@ -259,7 +259,7 @@ The following original `chrome-devtools-mcp` option is currently known as incomp
 
 Developer lifecycle and recovery reference:
 
-- [docs/BRIDGE_CONNECTION_LIFECYLE.md](./docs/BRIDGE_CONNECTION_LIFECYLE.md)
+- [docs/BRIDGE_CONNECTION_LIFECYCLE.md](./docs/BRIDGE_CONNECTION_LIFECYCLE.md)
 
 Development stack:
 
