@@ -14,6 +14,7 @@ import { once } from "node:events";
 import { createServer, type IncomingMessage } from "node:http";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import {
   buildWindowsChromeArgs,
@@ -27,6 +28,7 @@ import {
   runPowerShellFile,
   writePowerShellScript
 } from "./powershell.js";
+import { getBridgePowerShellScripts } from "./bridge-powershell-scripts.js";
 
 const POLL_INTERVAL_MS = 400;
 const CHROME_READY_TIMEOUT_MS = 30_000;
@@ -71,384 +73,6 @@ const IMPORTANT_EXCLUDED_METHODS = new Set<string>([
   "Storage.getStorageKey"
 ]);
 
-const LAUNCH_CHROME_PS = `
-param(
-  [string]$ChromePath,
-  [Parameter(ValueFromRemainingArguments = $true)]
-  [string[]]$ChromeArgs
-)
-$ErrorActionPreference = 'Stop'
-$ChromeArgs = $ChromeArgs | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) }
-$proc = Start-Process -FilePath $ChromePath -ArgumentList $ChromeArgs -PassThru
-Write-Output $proc.Id
-`;
-
-const FIND_EXISTING_CHROME_PS = `
-param([string]$UserDataDir)
-$ErrorActionPreference = 'Stop'
-
-function Normalize-UserDataDir {
-  param([string]$Value)
-
-  if ([string]::IsNullOrWhiteSpace($Value)) {
-    return $null
-  }
-
-  $trimmed = $Value.Trim('"')
-  $expanded = [Environment]::ExpandEnvironmentVariables($trimmed)
-  try {
-    $resolved = (Resolve-Path -LiteralPath $expanded -ErrorAction Stop).Path
-  } catch {
-    $resolved = $expanded
-  }
-  return $resolved.ToLowerInvariant()
-}
-
-$target = Normalize-UserDataDir -Value $UserDataDir
-if ([string]::IsNullOrWhiteSpace($target)) {
-  Write-Output '{"found":false}'
-  exit 0
-}
-
-$matchUserDataPattern = '(?i)--user-data-dir(?:=|\\s+)(?:"([^"]+)"|([^\\s"]+))'
-$matchPortPattern = '(?i)--remote-debugging-port(?:=|\\s+)(\\d{1,5})'
-$candidates = @()
-
-$processes = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'"
-foreach ($proc in $processes) {
-  $line = $proc.CommandLine
-  if ([string]::IsNullOrWhiteSpace($line)) {
-    continue
-  }
-
-  $userDataMatch = [Regex]::Match($line, $matchUserDataPattern)
-  if (-not $userDataMatch.Success) {
-    continue
-  }
-
-  $capturedUserDataDir = if ($userDataMatch.Groups[1].Success) {
-    $userDataMatch.Groups[1].Value
-  } else {
-    $userDataMatch.Groups[2].Value
-  }
-
-  $normalizedUserDataDir = Normalize-UserDataDir -Value $capturedUserDataDir
-  if ([string]::IsNullOrWhiteSpace($normalizedUserDataDir) -or $normalizedUserDataDir -ne $target) {
-    continue
-  }
-
-  $portMatch = [Regex]::Match($line, $matchPortPattern)
-  if (-not $portMatch.Success) {
-    continue
-  }
-
-  $parsedPort = [int]$portMatch.Groups[1].Value
-  if ($parsedPort -lt 1 -or $parsedPort -gt 65535) {
-    continue
-  }
-
-  $candidates += [PSCustomObject]@{
-    pid = [int]$proc.ProcessId
-    port = $parsedPort
-  }
-}
-
-if ($candidates.Count -eq 0) {
-  Write-Output '{"found":false}'
-  exit 0
-}
-
-$selected = $candidates | Sort-Object -Property pid -Descending | Select-Object -First 1
-Write-Output ($selected | ConvertTo-Json -Compress -Depth 4)
-`;
-
-const GET_VERSION_PS = `
-param([int]$Port)
-$ErrorActionPreference = 'Stop'
-$uri = "http://127.0.0.1:$Port/json/version"
-try {
-  $json = Invoke-RestMethod -UseBasicParsing -Uri $uri -TimeoutSec 2
-  if ($null -eq $json) { exit 1 }
-  $raw = $json | ConvertTo-Json -Compress -Depth 12
-  Write-Output $raw
-  exit 0
-} catch {
-  exit 1
-}
-`;
-
-const RESOLVE_PORT_PS = `
-param(
-  [int]$RequestedPort,
-  [string]$Mode
-)
-$ErrorActionPreference = 'Stop'
-
-function Test-PortAvailable {
-  param([int]$Port)
-  try {
-    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
-    $listener.Start()
-    $listener.Stop()
-    return $true
-  } catch {
-    return $false
-  }
-}
-
-function Get-RandomFreePort {
-  $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
-  $listener.Start()
-  $allocated = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
-  $listener.Stop()
-  return $allocated
-}
-
-if ($Mode -eq "fixed") {
-  if (-not (Test-PortAvailable -Port $RequestedPort)) {
-    Write-Error "Port $RequestedPort is already in use on Windows."
-    exit 2
-  }
-  Write-Output $RequestedPort
-  exit 0
-}
-
-if ($Mode -eq "random") {
-  if ($RequestedPort -gt 0 -and (Test-PortAvailable -Port $RequestedPort)) {
-    Write-Output $RequestedPort
-    exit 0
-  }
-
-  for ($i = 0; $i -lt 50; $i++) {
-    $candidate = Get-RandomFreePort
-    if (Test-PortAvailable -Port $candidate) {
-      Write-Output $candidate
-      exit 0
-    }
-  }
-
-  Write-Error "Failed to allocate an available Windows debug port."
-  exit 3
-}
-
-Write-Error "Unsupported mode: $Mode"
-exit 4
-`;
-
-const RELAY_CSHARP = String.raw`
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Net.WebSockets;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-
-public class CDPRelay
-{
-    private static string EscapeForLog(string value)
-    {
-        return (value ?? string.Empty).Replace("\r", "\\r").Replace("\n", "\\n");
-    }
-
-    private static void AppendField(StringBuilder sb, string key, string value)
-    {
-        if (sb.Length > 0)
-        {
-            sb.Append(";");
-        }
-        sb.Append(key);
-        sb.Append("=");
-        sb.Append(EscapeForLog(value ?? string.Empty));
-    }
-
-    private static string BuildInnerChain(Exception ex)
-    {
-        if (ex == null)
-        {
-            return string.Empty;
-        }
-
-        var parts = new List<string>();
-        var current = ex;
-        var depth = 0;
-        while (current != null && depth < 5)
-        {
-            var type = current.GetType().FullName ?? current.GetType().Name;
-            var hresult = "0x" + current.HResult.ToString("X8");
-            var message = EscapeForLog(current.Message ?? string.Empty);
-            parts.Add(type + "|" + hresult + "|" + message);
-            current = current.InnerException;
-            depth += 1;
-        }
-
-        if (current != null)
-        {
-            parts.Add("truncated");
-        }
-
-        return string.Join(" -> ", parts.ToArray());
-    }
-
-    private static string StackTop(string stackTrace)
-    {
-        if (string.IsNullOrEmpty(stackTrace))
-        {
-            return string.Empty;
-        }
-
-        var normalized = stackTrace.Replace("\r", string.Empty);
-        var lines = normalized.Split('\n');
-        if (lines.Length == 0)
-        {
-            return string.Empty;
-        }
-        return lines[0].Trim();
-    }
-
-    private static string FormatSocketState(ClientWebSocket ws)
-    {
-        var sb = new StringBuilder();
-        AppendField(sb, "wsState", ws != null ? ws.State.ToString() : string.Empty);
-        if (ws != null)
-        {
-            AppendField(
-                sb,
-                "wsCloseStatus",
-                ws.CloseStatus.HasValue ? ws.CloseStatus.Value.ToString() : string.Empty
-            );
-            AppendField(sb, "wsCloseDescription", ws.CloseStatusDescription ?? string.Empty);
-        }
-        return sb.ToString();
-    }
-
-    private static string FormatException(Exception ex, ClientWebSocket ws)
-    {
-        var sb = new StringBuilder();
-        var type = ex.GetType().FullName ?? ex.GetType().Name;
-        AppendField(sb, "type", type);
-        AppendField(sb, "hresult", "0x" + ex.HResult.ToString("X8"));
-        AppendField(sb, "message", ex.Message ?? string.Empty);
-
-        var webSocketException = ex as WebSocketException;
-        if (webSocketException != null)
-        {
-            AppendField(sb, "webSocketErrorCode", webSocketException.WebSocketErrorCode.ToString());
-        }
-
-        var socketException = ex as SocketException;
-        if (socketException == null && ex.InnerException != null)
-        {
-            socketException = ex.InnerException as SocketException;
-        }
-        if (socketException != null)
-        {
-            AppendField(sb, "socketErrorCode", socketException.ErrorCode.ToString());
-            AppendField(sb, "socketError", socketException.SocketErrorCode.ToString());
-        }
-
-        AppendField(sb, "innerChain", BuildInnerChain(ex.InnerException));
-        AppendField(sb, "stackTop", StackTop(ex.StackTrace));
-        AppendField(sb, "socketContext", FormatSocketState(ws));
-        return sb.ToString();
-    }
-
-    public static void Run(string wsUrl)
-    {
-        Console.InputEncoding = new UTF8Encoding(false);
-        Console.OutputEncoding = new UTF8Encoding(false);
-
-        var ws = new ClientWebSocket();
-        ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(30);
-        var cts = new CancellationTokenSource();
-        var token = cts.Token;
-
-        try
-        {
-            ws.ConnectAsync(new Uri(wsUrl), token).GetAwaiter().GetResult();
-            Console.Error.WriteLine("CONNECTED");
-            Console.Error.Flush();
-
-            var reader = Task.Run(() =>
-            {
-                var buf = new byte[4 * 1024 * 1024];
-                try
-                {
-                    while (ws.State == WebSocketState.Open && !token.IsCancellationRequested)
-                    {
-                        var sb = new StringBuilder();
-                        WebSocketReceiveResult recv;
-                        do
-                        {
-                            var seg = new ArraySegment<byte>(buf);
-                            recv = ws.ReceiveAsync(seg, token).GetAwaiter().GetResult();
-                            if (recv.MessageType == WebSocketMessageType.Close)
-                            {
-                                Console.Error.WriteLine("READER_CLOSE:" + FormatSocketState(ws));
-                                Console.Error.Flush();
-                                return;
-                            }
-                            sb.Append(Encoding.UTF8.GetString(buf, 0, recv.Count));
-                        } while (!recv.EndOfMessage);
-
-                        Console.Out.WriteLine(sb.ToString());
-                        Console.Out.Flush();
-                    }
-                }
-                catch (OperationCanceledException) { }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine("READER_ERROR:" + FormatException(ex, ws));
-                    Console.Error.Flush();
-                }
-            }, token);
-
-            string line;
-            while ((line = Console.In.ReadLine()) != null)
-            {
-                if (ws.State != WebSocketState.Open) break;
-                var bytes = Encoding.UTF8.GetBytes(line);
-                var seg = new ArraySegment<byte>(bytes);
-                ws.SendAsync(seg, WebSocketMessageType.Text, true, token).GetAwaiter().GetResult();
-            }
-
-            cts.Cancel();
-            reader.Wait(TimeSpan.FromSeconds(2));
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine("FATAL:" + FormatException(ex, ws));
-            Console.Error.Flush();
-        }
-        finally
-        {
-            if (ws.State == WebSocketState.Open)
-            {
-                try
-                {
-                    ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None).GetAwaiter().GetResult();
-                }
-                catch { }
-            }
-            ws.Dispose();
-        }
-    }
-}
-`;
-
-const RELAY_PS = `
-param([string]$WsUrl)
-$ErrorActionPreference = 'Stop'
-[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-Add-Type -TypeDefinition @'
-${RELAY_CSHARP}
-'@
-[CDPRelay]::Run($WsUrl)
-`;
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -489,6 +113,7 @@ interface RenderedCdpMessage {
 interface ExistingChromeMatch {
   port: number;
   pid: number | null;
+  headless: boolean;
 }
 
 type WeakDisconnectSignal = "Inspector.detached" | "Target.detachedFromTarget";
@@ -672,6 +297,15 @@ function collectBridgeEnvSnapshot(env: NodeJS.ProcessEnv): Record<string, string
   };
 }
 
+function hasRequestedHeadlessFlag(args: string[]): boolean {
+  for (const arg of args) {
+    if (arg === "--headless" || arg.startsWith("--headless=")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function cleanupEmptyLocalUserDataDirArtifact(
   userDataDir: string | null,
   writeDebug: (message: string) => void
@@ -746,10 +380,12 @@ function parseExistingChromeMatch(raw: string): ExistingChromeMatch | null {
       typeof pidRaw === "number" && Number.isFinite(pidRaw)
         ? Math.trunc(pidRaw)
         : Number.parseInt(String(pidRaw), 10);
+    const headless = value.headless === true;
 
     return {
       port,
-      pid: Number.isFinite(pid) ? pid : null
+      pid: Number.isFinite(pid) ? pid : null,
+      headless
     };
   } catch {
     return null;
@@ -1176,6 +812,7 @@ export function createBridgeRunner() {
     writeDebug(`debugLevel=${debugLevel}`);
 
     writeDebug(`argv=${JSON.stringify(chromeArgs)}`);
+    const requestedHeadlessMode = hasRequestedHeadlessFlag(plan.passthroughArgs);
     writeDebug(`launchPlan=${JSON.stringify({
       bridgeDebugFile: plan.bridgeDebugFile,
       bridgeDebugRawDir: plan.bridgeDebugRawDir,
@@ -1188,6 +825,7 @@ export function createBridgeRunner() {
       localProxyPort: plan.localProxyPort,
       windowsDebugPort: plan.windowsDebugPort,
       windowsDebugPortSource: plan.windowsDebugPortSource,
+      requestedHeadlessMode,
       passthroughArgs: plan.passthroughArgs
     })}`);
 
@@ -1204,17 +842,27 @@ export function createBridgeRunner() {
     const powerShell = createPowerShellContext(env);
     writeDebug(`powershellPath=${powerShell.powershellPath}`);
 
-    const launchScript = writePowerShellScript(powerShell, "launch-chrome.ps1", LAUNCH_CHROME_PS);
+    const scripts = getBridgePowerShellScripts();
+    const launchScript = writePowerShellScript(powerShell, "launch-chrome.ps1", scripts.launchChrome);
     const findExistingChromeScript = writePowerShellScript(
       powerShell,
       "find-existing-chrome.ps1",
-      FIND_EXISTING_CHROME_PS
+      scripts.findExistingChrome
     );
-    const getVersionScript = writePowerShellScript(powerShell, "get-version.ps1", GET_VERSION_PS);
-    const resolvePortScript = writePowerShellScript(powerShell, "resolve-port.ps1", RESOLVE_PORT_PS);
-    const relayScript = writePowerShellScript(powerShell, "relay.ps1", RELAY_PS);
+    const getVersionScript = writePowerShellScript(powerShell, "get-version.ps1", scripts.getVersion);
+    const resolvePortScript = writePowerShellScript(
+      powerShell,
+      "resolve-port.ps1",
+      scripts.resolvePort
+    );
+    const stopChromeScript = writePowerShellScript(
+      powerShell,
+      "stop-chrome-by-profile-port.ps1",
+      scripts.stopChromeByProfilePort
+    );
+    const relayScript = writePowerShellScript(powerShell, "relay.ps1", scripts.relay);
     writeDebug(
-      `scripts={launch:${launchScript.windowsPath},findExisting:${findExistingChromeScript.windowsPath},version:${getVersionScript.windowsPath},resolvePort:${resolvePortScript.windowsPath},relay:${relayScript.windowsPath}}`
+      `scripts={launch:${launchScript.windowsPath},findExisting:${findExistingChromeScript.windowsPath},version:${getVersionScript.windowsPath},resolvePort:${resolvePortScript.windowsPath},stopChrome:${stopChromeScript.windowsPath},relay:${relayScript.windowsPath}}`
     );
 
     const usePipeTransport = plan.usePipeTransport && hasPipeFds();
@@ -1247,6 +895,8 @@ export function createBridgeRunner() {
       remoteVersion: Record<string, unknown>;
       remoteBrowserWsUrl: string;
       ownership: "attached" | "launched";
+      chromePid: number | null;
+      launchedExecutablePath: string | null;
     }
 
     const waitForRemoteVersion = async (
@@ -1318,7 +968,7 @@ export function createBridgeRunner() {
       }
 
       writeDebug(
-        `existingChrome hit phase=${phase} port=${existingMatch.port} pid=${existingMatch.pid ?? "unknown"}`
+        `existingChrome hit phase=${phase} port=${existingMatch.port} pid=${existingMatch.pid ?? "unknown"} headless=${existingMatch.headless}`
       );
       const version = await waitForRemoteVersion(existingMatch.port, phase);
       if (!version || typeof version.webSocketDebuggerUrl !== "string") {
@@ -1327,12 +977,21 @@ export function createBridgeRunner() {
         );
         return null;
       }
+      if (existingMatch.headless !== requestedHeadlessMode) {
+        const existingMode = existingMatch.headless ? "headless" : "headed";
+        const requestedMode = requestedHeadlessMode ? "headless" : "headed";
+        throw new Error(
+          `headless mode mismatch for shared --user-data-dir "${plan.windowsUserDataDir}". Existing Chrome mode is ${existingMode}, requested mode is ${requestedMode}. Use a different --user-data-dir per mode, or close the existing Chrome instance first.`
+        );
+      }
 
       return {
         windowsDebugPort: existingMatch.port,
         remoteVersion: version,
         remoteBrowserWsUrl: version.webSocketDebuggerUrl,
-        ownership: "attached"
+        ownership: "attached",
+        chromePid: null,
+        launchedExecutablePath: null
       };
     };
 
@@ -1404,7 +1063,9 @@ export function createBridgeRunner() {
         windowsDebugPort: resolvedWindowsDebugPort,
         remoteVersion: version,
         remoteBrowserWsUrl: version.webSocketDebuggerUrl,
-        ownership: "launched"
+        ownership: "launched",
+        chromePid: Number.isFinite(launchedPid) ? launchedPid : null,
+        launchedExecutablePath: chromePath
       };
     };
 
@@ -1433,10 +1094,45 @@ export function createBridgeRunner() {
     let activeRemoteBrowserWsUrl = startupSession.remoteBrowserWsUrl;
     let activeWindowsDebugPort = startupSession.windowsDebugPort;
     let activeOwnership: "attached" | "launched" = startupSession.ownership;
+    let activeChromePid: number | null = startupSession.chromePid;
+    let activeLaunchedExecutablePath: string | null = startupSession.launchedExecutablePath;
     const startupRemoteVersion = startupSession.remoteVersion;
     writeDebug(
-      `startupSession established ownership=${activeOwnership} port=${activeWindowsDebugPort} ws=${activeRemoteBrowserWsUrl}`
+      `startupSession established ownership=${activeOwnership} port=${activeWindowsDebugPort} chromePid=${activeChromePid ?? "unknown"} ws=${activeRemoteBrowserWsUrl}`
     );
+
+    const startBridgeWatchdog = (chromePid: number): void => {
+      const watchdogScriptPath = fileURLToPath(new URL("./bridge-watchdog.js", import.meta.url));
+      const watchdogArgs = [
+        watchdogScriptPath,
+        "--bridge-pid",
+        String(process.pid),
+        "--chrome-pid",
+        String(chromePid),
+        "--powershell-path",
+        powerShell.powershellPath
+      ];
+      if (activeLaunchedExecutablePath) {
+        watchdogArgs.push("--expected-executable-path", activeLaunchedExecutablePath);
+      }
+      if (activeDebugFile) {
+        watchdogArgs.push("--debug-file", activeDebugFile);
+      }
+
+      const watchdog = spawn(process.execPath, watchdogArgs, {
+        env,
+        detached: true,
+        stdio: "ignore"
+      });
+      watchdog.unref();
+      writeDebug(
+        `watchdog started pid=${watchdog.pid ?? "unknown"} bridgePid=${process.pid} chromePid=${chromePid}`
+      );
+    };
+
+    if (usePipeTransport && requestedHeadlessMode && activeOwnership === "launched" && activeChromePid) {
+      startBridgeWatchdog(activeChromePid);
+    }
 
     let pipeIn: ReturnType<typeof createReadStream> | null = null;
     let pipeOut: ReturnType<typeof createWriteStream> | null = null;
@@ -1540,6 +1236,18 @@ export function createBridgeRunner() {
           // ignore
         }
         await Promise.race([once(child, "exit"), sleep(1_000)]);
+      }
+
+      if (usePipeTransport && requestedHeadlessMode && plan.windowsUserDataDir) {
+        const stopResult = await runPowerShellFile(
+          powerShell,
+          stopChromeScript.windowsPath,
+          [plan.windowsUserDataDir, String(activeWindowsDebugPort)],
+          { timeoutMs: 8_000 }
+        );
+        writeDebug(
+          `cleanup stopHeadlessChrome code=${stopResult.code} port=${activeWindowsDebugPort} ownership=${activeOwnership} stdout=${stopResult.stdout.trim()} stderr=${stopResult.stderr.trim()}`
+        );
       }
 
       destroyPowerShellContext(powerShell);
@@ -1973,8 +1681,10 @@ export function createBridgeRunner() {
           activeRemoteBrowserWsUrl = recoverySession.remoteBrowserWsUrl;
           activeWindowsDebugPort = recoverySession.windowsDebugPort;
           activeOwnership = recoverySession.ownership;
+          activeChromePid = recoverySession.chromePid;
+          activeLaunchedExecutablePath = recoverySession.launchedExecutablePath;
           writeDebug(
-            `recovery success ownership=${activeOwnership} port=${activeWindowsDebugPort} ws=${activeRemoteBrowserWsUrl}`
+            `recovery success ownership=${activeOwnership} port=${activeWindowsDebugPort} chromePid=${activeChromePid ?? "unknown"} ws=${activeRemoteBrowserWsUrl}`
           );
           startRelay(activeRemoteBrowserWsUrl, "recovery");
         })()
