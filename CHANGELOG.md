@@ -1,7 +1,7 @@
 wsl-chrome-bridge Change Log
 ============================
 
-0.3.0 under development
+0.3.0 2026-04-21
 -----------------------
  - Added Chrome instance reuse by matching `--user-data-dir` on Windows and reusing the matched instance `--remote-debugging-port` when available.
  - Added runtime ownership model (`attached` / `launched`) and removed bridge-driven Chrome termination from cleanup to keep user Chrome sessions intact.
