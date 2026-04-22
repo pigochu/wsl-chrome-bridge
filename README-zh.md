@@ -227,7 +227,7 @@ WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx
 - `WSL_CHROME_BRIDGE_DEBUG_LEVEL=all|important` : 可選 debug 詳細度。`important`（預設）只記錄 session / 開頁導覽 / 斷線相關的重要 method 與錯誤回應；`all` 會記錄全部 CDP relay 訊息。
 - `WSL_CHROME_BRIDGE_DEBUG_RAW_DIR=/tmp/wsl-chrome-bridge-raw` : 以環境變數指定 raw CDP 內容輸出目錄。每筆 request/response/event 會獨立寫入一個 `raw-<timestamp>.log` 檔案，且 `WSL_CHROME_BRIDGE_DEBUG_FILE` 的 relay log 會包含對應的 `rawPath`。
 
-### Q6. 已確認無法使用的參數
+## 已確認無法使用的參數
 
 以下列表為搭配本程式確定無法使用 `chrome-devtools-mcp` 原始參數
 

@@ -229,7 +229,7 @@ WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx
 - `WSL_CHROME_BRIDGE_DEBUG_LEVEL=all|important`: optional debug verbosity level. `important` (default) logs only important session/navigation/disconnect-related CDP methods and error responses. `all` logs all CDP relay traffic.
 - `WSL_CHROME_BRIDGE_DEBUG_RAW_DIR=/tmp/wsl-chrome-bridge-raw`: optional directory to store full raw CDP payload files. Each request/response/event payload is written as a separate `raw-<timestamp>.log` file, and `WSL_CHROME_BRIDGE_DEBUG_FILE` includes the corresponding `rawPath` for each relay log entry.
 
-### Q6. Known incompatible original arguments
+## Known incompatible original arguments
 
 The following original `chrome-devtools-mcp` option is currently known as incompatible in this bridge setup:
 
