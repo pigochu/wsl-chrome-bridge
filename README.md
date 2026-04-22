@@ -119,24 +119,6 @@ In bridge + system Chrome usage, `--browser chrome` helps avoid upstream `--no-s
 > See the FAQ for how to locate `--executablePath`.
 > For more configuration patterns, see `agent-config-sample/.codex/`.
 
-## Build
-
-```bash
-npm install
-npm run build
-```
-
-## Local Tests
-
-```bash
-npm test
-```
-
-Test layers:
-
-- Unit tests: path conversion, argument normalization, bridge launch planning
-- Scenario tests: CLI argument passing integration into bridge runner
-
 ## FAQ
 
 ### How to find `--executablePath`
@@ -261,10 +243,28 @@ Developer lifecycle and recovery reference:
 
 - [docs/BRIDGE_CONNECTION_LIFECYCLE.md](./docs/BRIDGE_CONNECTION_LIFECYCLE.md)
 
-Development stack:
+### Development stack:
 
 - Node 24
 - TypeScript v6
 - Commander v14
 - ws v8.20
 - Test framework: Vitest v4.1
+
+### Build
+
+```bash
+npm install
+npm run build
+```
+
+### Local Tests
+
+```bash
+npm test
+```
+
+Test layers:
+
+- Unit tests: path conversion, argument normalization, bridge launch planning
+- Scenario tests: CLI argument passing integration into bridge runner

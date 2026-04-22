@@ -114,25 +114,6 @@ DISPLAY = ":9999"
 > FAQ 章節有介紹 `--executablePath` 的路徑尋找的方式。
 > 其他設定寫法可參考 `agent-config-sample/.codex/`。
 
-## 安裝與建置
-
-```bash
-npm install
-npm run build
-```
-
-## 本地測試
-
-```bash
-npm test
-```
-
-測試分成兩層：
-
-- 單元測試：路徑轉換、參數標準化、bridge 啟動規劃
-- 情境測試：CLI 對 bridge runner 的參數傳遞整合
-
-
 ## FAQ
 
 ### `--executablePath` 如何找
@@ -261,10 +242,28 @@ WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx
 
 - [docs/BRIDGE_CONNECTION_LIFECYCLE-zh.md](./docs/BRIDGE_CONNECTION_LIFECYCLE-zh.md)
 
-開發時所用技術棧：
+### 開發時所用技術棧：
 
 - Node 24
 - TypeScript v6
 - Commander v14
 - ws v8.20
 - 測試框架: Vitest v4.1
+
+### 安裝與建置
+
+```bash
+npm install
+npm run build
+```
+
+### 本地測試
+
+```bash
+npm test
+```
+
+測試分成兩層：
+
+- 單元測試：路徑轉換、參數標準化、bridge 啟動規劃
+- 情境測試：CLI 對 bridge runner 的參數傳遞整合
