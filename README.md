@@ -121,7 +121,7 @@ In bridge + system Chrome usage, `--browser chrome` helps avoid upstream `--no-s
 
 ## FAQ
 
-### How to find `--executablePath`
+### Q1. How to find `--executablePath`
 
 `chrome-devtools-mcp` expects `--executablePath` to be a file path, not just a command name (for example `wsl-chrome-bridge`).
 
@@ -156,7 +156,7 @@ ls -la ~/.local/share/mise/shims/wsl-chrome-bridge
 - Without a version manager, `command -v` is a direct and valid way to get an absolute path.
 - With mise multi-version Node, prefer `/home/<user>/.local/share/mise/shims/wsl-chrome-bridge` so path does not break when Node versions change.
 
-### Why Playwright needs `DISPLAY`
+### Q2. Why Playwright needs `DISPLAY`
 
 In WSL/Linux, `playwright-mcp` checks display availability before launching the browser.  
 If `DISPLAY` is not set, Playwright often switches to headless behavior (even when you did not explicitly pass `--headless`).
@@ -164,7 +164,7 @@ If `DISPLAY` is not set, Playwright often switches to headless behavior (even wh
 That decision happens upstream before bridge logic starts, so `wsl-chrome-bridge` cannot override it later.  
 If you want to see a visible Chrome window on Windows, set `DISPLAY` in MCP `env` (for example `DISPLAY=:999`).
 
-### Headless vs headed behavior on upstream MCP exit
+### Q3. Headless vs headed behavior on upstream MCP exit
 
 `wsl-chrome-bridge` applies the following lifecycle policy when upstream MCP exits (for example `chrome-devtools-mcp` / `playwright-mcp`):
 
@@ -173,7 +173,7 @@ If you want to see a visible Chrome window on Windows, set `DISPLAY` in MCP `env
 
 This behavior is intentional and can differ from native Playwright defaults in some workflows.
 
-### Why Playwright may show `--no-sandbox` warning
+### Q4. Why Playwright may show `--no-sandbox` warning
 
 When `playwright-mcp` is launched without an explicit browser channel, it may resolve to launch args that include `--no-sandbox`. In headed Chrome, this shows the warning banner:
 `You are using an unsupported command-line flag: --no-sandbox`.
@@ -186,7 +186,7 @@ For bridge usage with system Chrome, recommend adding:
 
 This keeps Playwright on the Chrome channel and avoids passing `--no-sandbox` in the common setup.
 
-### About `--user-data-dir`
+### Q5. About `--user-data-dir`
 
 `wsl-chrome-bridge` accepts direct `--user-data-dir` / `--userDataDir` values from upstream MCP.
 
@@ -229,7 +229,7 @@ WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx
 - `WSL_CHROME_BRIDGE_DEBUG_LEVEL=all|important`: optional debug verbosity level. `important` (default) logs only important session/navigation/disconnect-related CDP methods and error responses. `all` logs all CDP relay traffic.
 - `WSL_CHROME_BRIDGE_DEBUG_RAW_DIR=/tmp/wsl-chrome-bridge-raw`: optional directory to store full raw CDP payload files. Each request/response/event payload is written as a separate `raw-<timestamp>.log` file, and `WSL_CHROME_BRIDGE_DEBUG_FILE` includes the corresponding `rawPath` for each relay log entry.
 
-### Known incompatible original arguments
+### Q6. Known incompatible original arguments
 
 The following original `chrome-devtools-mcp` option is currently known as incompatible in this bridge setup:
 

@@ -116,7 +116,7 @@ DISPLAY = ":9999"
 
 ## FAQ
 
-### `--executablePath` 如何找
+### Q1. `--executablePath` 如何找
 
 `chrome-devtools-mcp` 的 `--executablePath` 必須是「檔案路徑」，不能只填指令名（例如 `wsl-chrome-bridge`）。
 
@@ -151,7 +151,7 @@ ls -la ~/.local/share/mise/shims/wsl-chrome-bridge
 - 不使用版本管理工具時，透過 `command -v` 找絕對路徑是可行且直接的方法。
 - 使用 mise 多版本 Node 時，建議使用 `/home/<user>/.local/share/mise/shims/wsl-chrome-bridge`，避免 Node 版本切換後路徑失效。
 
-### 為什麼 Playwright 需要設定 `DISPLAY`
+### Q2. 為什麼 Playwright 需要設定 `DISPLAY`
 
 在 WSL/Linux 環境下，`playwright-mcp` 啟動瀏覽器時會先判斷圖形顯示環境。  
 若 `DISPLAY` 沒有設定，Playwright 通常會改成 headless 行為（即使你沒有手動指定 `--headless`）。
@@ -159,7 +159,7 @@ ls -la ~/.local/share/mise/shims/wsl-chrome-bridge
 而這個判斷是在 bridge 之前就完成，所以 `wsl-chrome-bridge` 無法在後段覆蓋該決策。  
 如果你希望在 Windows 看到實際 Chrome 視窗，請於 MCP `env` 額外設定 `DISPLAY`（例如 `DISPLAY=:999`）。
 
-### 上游 MCP 結束時，Headless 與非 Headless 行為
+### Q3. 上游 MCP 結束時，Headless 與非 Headless 行為
 
 `wsl-chrome-bridge` 在上游 MCP（例如 `chrome-devtools-mcp` / `playwright-mcp`）結束時，採用以下生命週期策略：
 
@@ -168,7 +168,7 @@ ls -la ~/.local/share/mise/shims/wsl-chrome-bridge
 
 這是刻意設計的行為，與原生 Playwright 在部分流程下的預設行為可能不同。
 
-### 為什麼 Playwright 可能出現 `--no-sandbox` 警告
+### Q4. 為什麼 Playwright 可能出現 `--no-sandbox` 警告
 
 `playwright-mcp` 若未明確指定 browser channel，可能會產生含 `--no-sandbox` 的啟動參數。  
 在有視窗的 Chrome 中，會看到這類警告列：
@@ -183,7 +183,7 @@ ls -la ~/.local/share/mise/shims/wsl-chrome-bridge
 這樣在常見 bridge 設定下可避免上游傳入 `--no-sandbox`。
 
 
-### `--user-data-dir` 說明
+### Q5. `--user-data-dir` 說明
 
 `wsl-chrome-bridge` 現在支援上游 MCP 直接傳入 `--user-data-dir` / `--userDataDir`。
 
@@ -227,7 +227,7 @@ WSL_CHROME_BRIDGE_USER_DATA_DIR = "%TEMP%\\wsl-chrome-bridge\\chrome-profile-xxx
 - `WSL_CHROME_BRIDGE_DEBUG_LEVEL=all|important` : 可選 debug 詳細度。`important`（預設）只記錄 session / 開頁導覽 / 斷線相關的重要 method 與錯誤回應；`all` 會記錄全部 CDP relay 訊息。
 - `WSL_CHROME_BRIDGE_DEBUG_RAW_DIR=/tmp/wsl-chrome-bridge-raw` : 以環境變數指定 raw CDP 內容輸出目錄。每筆 request/response/event 會獨立寫入一個 `raw-<timestamp>.log` 檔案，且 `WSL_CHROME_BRIDGE_DEBUG_FILE` 的 relay log 會包含對應的 `rawPath`。
 
-### 已確認無法使用的參數
+### Q6. 已確認無法使用的參數
 
 以下列表為搭配本程式確定無法使用 `chrome-devtools-mcp` 原始參數
 
