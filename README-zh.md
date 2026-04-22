@@ -163,10 +163,14 @@ ls -la ~/.local/share/mise/shims/wsl-chrome-bridge
 
 `wsl-chrome-bridge` 在上游 MCP（例如 `chrome-devtools-mcp` / `playwright-mcp`）結束時，採用以下生命週期策略：
 
-- 若 Chrome 是以 headless 啟動，bridge 一律會結束該 Chrome 行程。
-- 若 Chrome 不是以 headless 啟動（headed / non-headless），bridge 一律保留該 Chrome 行程。
+- 若 Chrome 是以 headless 啟動，通常是為了進行自動測試，測試完畢大概就沒用了，因此 bridge 一律會結束背景 Chrome 行程，以防 Windows 端殘留背景 Chrome。
+- 若 Chrome 不是以 headless 啟動（headed / non-headless），通常是用戶想看到畫面結果或參與實際操作，bridge 一律保留該 Chrome 行程，這樣用戶的 Chrome 視窗還在，下次重新啟動 AI 助手時，也能接著使用原本開啟的 Chrome。
 
-這是刻意設計的行為，與原生 Playwright 在部分流程下的預設行為可能不同。
+上述的行為是刻意設計的，因為原生 `chrome-devtools-mcp` 與 `playwright-mcp` 的行為是不同的，如下：
+- `chrome-devtools-mcp` 不論是 headed 或 headless 都不會主動關閉 Chrome。
+- `playwright-mcp` 不論是 headed 或 headless 都會主動關閉 Chrome。
+
+而 `wsl-chrome-bridge` 統一了兩者的不一致。 
 
 ### Q4. 為什麼 Playwright 可能出現 `--no-sandbox` 警告
 

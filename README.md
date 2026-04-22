@@ -168,10 +168,15 @@ If you want to see a visible Chrome window on Windows, set `DISPLAY` in MCP `env
 
 `wsl-chrome-bridge` applies the following lifecycle policy when upstream MCP exits (for example `chrome-devtools-mcp` / `playwright-mcp`):
 
-- If Chrome was started in headless mode, bridge always terminates that Chrome process.
-- If Chrome was started in headed mode (non-headless), bridge always keeps that Chrome process.
+- If Chrome was started in headless mode, it is usually for automated testing; after the test finishes, it is probably no longer needed, so bridge always terminates that background Chrome process to avoid leaving one behind on Windows.
+- If Chrome was started in headed mode (non-headless), it usually means the user wants to see the result on screen or continue interacting manually; bridge always keeps that Chrome process, so the Chrome window stays open and the next time the AI assistant restarts, it can continue using the original Chrome session.
 
-This behavior is intentional and can differ from native Playwright defaults in some workflows.
+This behavior is intentional, because native `chrome-devtools-mcp` and `playwright-mcp` do not behave the same way:
+
+- `chrome-devtools-mcp` does not actively close Chrome, whether it is headed or headless.
+- `playwright-mcp` actively closes Chrome, whether it is headed or headless.
+
+`wsl-chrome-bridge` normalizes that mismatch.
 
 ### Q4. Why Playwright may show `--no-sandbox` warning
 
