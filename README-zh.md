@@ -15,6 +15,15 @@
 
 若你是從 `0.1.0` 升級，請先閱讀升級說明文件：[UPGRADE-zh.md](./UPGRADE-zh.md)。
 
+## 專案特色
+
+- 👍 **使用原 MCP 工具**：`wsl-chrome-bridge` 並非取代 `chrome-devtools-mcp` 或 `playwright-mcp`，而是讓你在 WSL2 內沿用原有工具操作 Windows Chrome。
+- ⚡ **無須系統級設定**：不需要設定 WSL Mirrored Mode、portproxy，也不用安裝額外繞路工具。
+- ⚙️ **設定門檻低**：通常只要在原有 MCP 設定中調整 `--executablePath` 與少量參數即可運作。
+- 🛡️ **統一退出行為**：`chrome-devtools-mcp` 與 `playwright-mcp` 退出時對於 Chrome 的關閉行為完全不同，本專案會將這兩種退出行為做一致化處理。
+    - 🖥️ headed 模式下，若 MCP 退出，Windows Chrome 視窗仍保持。
+    - 🤖 headless 模式下，若 MCP 退出，處於背景執行的 Windows Chrome 行程會被自動銷毀。
+
 ## 基本運作方式
 
 ```text

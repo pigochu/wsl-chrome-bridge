@@ -21,6 +21,15 @@ This idea came from [wsl-chrome-mcp](https://github.com/477174/wsl-chrome-mcp), 
 
 If you are upgrading from `0.1.0`, read the upgrade guide first: [UPGRADE.md](./UPGRADE.md).
 
+## Project Highlights
+
+- 👍 **Keep your existing MCP tools**: `wsl-chrome-bridge` does not replace `chrome-devtools-mcp` or `playwright-mcp`; it lets you keep using your current tools in WSL2 to control Windows Chrome.
+- ⚡ **No system-level setup required**: no WSL Mirrored Mode, no portproxy, and no extra workaround tools to install.
+- ⚙️ **Low setup overhead**: in most cases, you only need to adjust `--executablePath` and a few arguments in your existing MCP config.
+- 🛡️ **Unified shutdown behavior**: `chrome-devtools-mcp` and `playwright-mcp` have different Chrome shutdown behavior on exit; this project normalizes that behavior.
+    - 🖥️ In headed mode, if MCP exits, the Windows Chrome window stays open.
+    - 🤖 In headless mode, if MCP exits, the background Windows Chrome process is automatically terminated.
+
 ## How It Works
 
 ```text
