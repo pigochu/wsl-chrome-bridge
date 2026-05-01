@@ -37,6 +37,8 @@ const MAX_TRACKED_REQUEST_METHODS = 100;
 const INTERNAL_CDP_REQUEST_ID_START = 900_000_000;
 const DISCONNECT_EVENT_BUFFER_LIMIT = 10;
 const DISCONNECT_EVENT_TIME_WINDOW_MS = 2_000;
+const DELAYED_BROWSER_CLOSE_FORWARD_MS = 200;
+const PLAYWRIGHT_BROWSER_CLOSE_REQUEST_ID = "-9999";
 type BridgeDebugLevel = "all" | "important";
 
 const IMPORTANT_CDP_METHODS = new Set<string>([
@@ -1197,6 +1199,8 @@ export function createBridgeRunner() {
     let relayGeneration = 0;
     let relayChild: ReturnType<typeof spawn> | null = null;
     let pendingFromPipe = Buffer.alloc(0);
+    const delayedBrowserCloseForwardTimers = new Map<string, NodeJS.Timeout>();
+    const suppressedBrowserCloseResponseCounts = new Map<string, number>();
     const queuedForRelay: Array<{
       message: string;
       rendered: RenderedCdpMessage;
@@ -1215,6 +1219,12 @@ export function createBridgeRunner() {
       }
       closed = true;
       writeDebug(`cleanup start code=${code}`);
+
+      for (const timer of delayedBrowserCloseForwardTimers.values()) {
+        clearTimeout(timer);
+      }
+      delayedBrowserCloseForwardTimers.clear();
+      suppressedBrowserCloseResponseCounts.clear();
 
       pipeIn?.destroy();
       pipeOut?.destroy();
@@ -1471,6 +1481,41 @@ export function createBridgeRunner() {
         queuedForRelay.push({ message, rendered });
       };
 
+      const scheduleDelayedBrowserCloseForward = (
+        key: string,
+        message: string,
+        rendered: RenderedCdpMessage
+      ): void => {
+        const previousTimer = delayedBrowserCloseForwardTimers.get(key);
+        if (previousTimer) {
+          clearTimeout(previousTimer);
+        }
+        const timer = setTimeout(() => {
+          if (shuttingDown || closed || resolving) {
+            delayedBrowserCloseForwardTimers.delete(key);
+            writeDebug(
+              `delayedForward Browser.close skipped reason=shuttingDown id=${String(rendered.parsed.id)} session=${rendered.parsed.sessionId ?? "root"}`
+            );
+            return;
+          }
+          if (delayedBrowserCloseForwardTimers.get(key) !== timer) {
+            return;
+          }
+          delayedBrowserCloseForwardTimers.delete(key);
+          const delayedRendered = renderCdpMessage(message);
+          suppressedBrowserCloseResponseCounts.set(
+            key,
+            (suppressedBrowserCloseResponseCounts.get(key) ?? 0) + 1
+          );
+          writeDebug(
+            `delayedForward Browser.close fire delayMs=${DELAYED_BROWSER_CLOSE_FORWARD_MS} id=${String(rendered.parsed.id)} session=${rendered.parsed.sessionId ?? "root"}`
+          );
+          sendToRelayOrQueue(message, delayedRendered);
+        }, DELAYED_BROWSER_CLOSE_FORWARD_MS);
+        timer.unref();
+        delayedBrowserCloseForwardTimers.set(key, timer);
+      };
+
       const startRelay = (remoteBrowserWsUrl: string, reason: string): void => {
         if (shuttingDown) {
           writeDebug(`startRelay skipped reason=shuttingDown trigger=${reason}`);
@@ -1621,13 +1666,29 @@ export function createBridgeRunner() {
 	            if (!line) {
 	              continue;
 	            }
-	            const rendered = renderCdpMessage(line);
-	            if (tryHandleInternalCdpResponse(generation, rendered, child)) {
-	              continue;
-	            }
-	            const weakDisconnectSignal = detectWeakDisconnectSignalFromCdp(rendered);
-	            if (weakDisconnectSignal) {
-	              noteDisconnectSignal(weakDisconnectSignal, "chromeEvent");
+            const rendered = renderCdpMessage(line);
+            if (tryHandleInternalCdpResponse(generation, rendered, child)) {
+              continue;
+            }
+            if (rendered.parsed.kind === "response" && rendered.parsed.id !== null) {
+              const key = requestKey(rendered.parsed.id, rendered.parsed.sessionId);
+              const suppressedCount = suppressedBrowserCloseResponseCounts.get(key) ?? 0;
+              if (suppressedCount > 0 && rendered.canonicalMethod === "Browser.close") {
+                if (suppressedCount === 1) {
+                  suppressedBrowserCloseResponseCounts.delete(key);
+                } else {
+                  suppressedBrowserCloseResponseCounts.set(key, suppressedCount - 1);
+                }
+                writeDebug(
+                  `delayedForward Browser.close swallowResponse id=${String(rendered.parsed.id)} session=${rendered.parsed.sessionId ?? "root"}`
+                );
+                writeCdpHopLog("chrome=>relay", rendered);
+                continue;
+              }
+            }
+            const weakDisconnectSignal = detectWeakDisconnectSignalFromCdp(rendered);
+            if (weakDisconnectSignal) {
+              noteDisconnectSignal(weakDisconnectSignal, "chromeEvent");
               rememberWeakDisconnectEvent(weakDisconnectSignal, line, Date.now());
             }
             writeCdpHopLog("chrome=>relay", rendered);
@@ -1729,6 +1790,35 @@ export function createBridgeRunner() {
             `shortCircuit Browser.close reason=chromeAlreadyClosed relayState=${relayState} id=${String(rendered.parsed.id)} session=${rendered.parsed.sessionId ?? "root"}`
           );
           forwardToUpstream(syntheticMessage, syntheticRendered);
+          return;
+        }
+        const requestId = rendered.parsed.id;
+        const shouldInterceptPlaywrightBrowserCloseForExitDetection =
+          usePipeTransport &&
+          !requestedHeadlessMode &&
+          rendered.parsed.kind === "request" &&
+          rendered.canonicalMethod === "Browser.close" &&
+          requestId !== null &&
+          String(requestId) === PLAYWRIGHT_BROWSER_CLOSE_REQUEST_ID;
+        if (shouldInterceptPlaywrightBrowserCloseForExitDetection) {
+          if (requestId === null) {
+            return;
+          }
+          const key = requestKey(requestId, rendered.parsed.sessionId);
+          const syntheticResponse: Record<string, unknown> = {
+            id: requestId,
+            result: {}
+          };
+          if (rendered.parsed.sessionId) {
+            syntheticResponse.sessionId = rendered.parsed.sessionId;
+          }
+          const syntheticMessage = JSON.stringify(syntheticResponse);
+          const syntheticRendered = renderCdpMessage(syntheticMessage);
+          writeDebug(
+            `delayedForward Browser.close intercept delayMs=${DELAYED_BROWSER_CLOSE_FORWARD_MS} id=${String(rendered.parsed.id)} session=${rendered.parsed.sessionId ?? "root"}`
+          );
+          forwardToUpstream(syntheticMessage, syntheticRendered);
+          scheduleDelayedBrowserCloseForward(key, message, rendered);
           return;
         }
         if (!usePipeTransport && relayState === "degraded") {

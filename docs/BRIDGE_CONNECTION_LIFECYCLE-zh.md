@@ -114,6 +114,24 @@
    - bridge 直接回傳成功 response（`{ id: <same>, result: {} }`），不觸發 recovery、不進 queue。
    - 目的：避免 Playwright/Codex 結束流程送出 `Browser.close` 時，把已關閉的 Chrome 又拉起來再關一次。
 
+0.5. `pipe + non-headless` 的 `Browser.close(id=-9999)` 延遲轉發策略（Playwright 退出一致化）：
+   - 觸發條件：
+     - transport 為 `pipe`
+     - 非 headless
+     - request method 為 `Browser.close`
+     - request id 為 `-9999`（目前 Playwright MCP 可觀察到的關閉 id）
+   - 行為：
+     - bridge 先回傳 synthetic success response 給 upstream（同 id / 同 sessionId）。
+     - bridge 不立即轉發此 request 到 Chrome，先延遲 200ms。
+     - 若 200ms 到期時 bridge 仍存活，才把原始 `Browser.close` request 轉發給 relay。
+     - 延遲轉發後，Chrome 回來的同筆 `Browser.close` response 由 bridge 內部吞掉，不再回 upstream（避免 upstream 收到重複 response）。
+   - 目的：
+     - 讓「MCP 退出」與「使用者真的要關瀏覽器」可透過短時間窗做行為分流，避免 non-headless 在 MCP 退出時立刻關閉 Windows Chrome。
+   - 限制與邊界：
+     - 此策略不適用於 headless。
+     - 200ms 為策略參數（非協議保證值），需依實測調整。
+     - 若上游未來改變關閉 id 或關閉流程，需同步調整條件。
+
 1. bridge 先嘗試 `recoverChromeForCurrentUserDataDir()`：
    - 先探測是否已有同 `user-data-dir` Chrome 可附著。
    - 若可附著：更新 `remoteBrowserWsUrl` 並重建 relay，狀態回 `connected`。

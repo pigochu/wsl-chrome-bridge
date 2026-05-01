@@ -113,6 +113,24 @@ To avoid false positives from a single event (for example `Inspector.detached`),
    - if bridge has `chromeDisconnectedLikely=true` and current request is `Browser.close`
    - return synthetic success response (`{ id: <same>, result: {} }`) immediately
    - do not trigger recovery and do not queue this request
+
+0.5. Delayed `Browser.close(id=-9999)` forwarding in `pipe + non-headless` (Playwright exit normalization):
+   - Trigger conditions:
+     - transport mode is `pipe`
+     - non-headless
+     - request method is `Browser.close`
+     - request id is `-9999` (currently observable in Playwright MCP close flow)
+   - Behavior:
+     - bridge first returns a synthetic success response to upstream (same id / same sessionId)
+     - bridge does not forward this request to Chrome immediately; it delays forwarding by 200ms
+     - if bridge is still alive when the 200ms timer fires, it forwards the original `Browser.close` request to relay
+     - after delayed forward, the matching Chrome `Browser.close` response is consumed inside bridge and not forwarded upstream (to avoid duplicate responses)
+   - Purpose:
+     - use a short timing window to split behavior between "MCP exit" and "user intentionally closes browser", so non-headless MCP exit does not immediately close foreground Windows Chrome
+   - Limits and boundaries:
+     - this strategy does not apply to headless
+     - 200ms is a policy parameter (not a protocol guarantee) and should be tuned by integration tests
+     - if upstream changes close id semantics or close flow, this condition must be updated
 1. Bridge runs `recoverChromeForCurrentUserDataDir()`:
    - first try attach to existing same-profile Chrome
    - if attach succeeds: refresh `remoteBrowserWsUrl`, rebuild relay, transition to `connected`

@@ -29,7 +29,7 @@
 ```text
 [Chrome DevTools MCP]             [Playwright MCP]
          |                              |
-      stdio pipe                remote-debugging-port
+      stdio pipe           remote-debugging-port/stdio pipe
          |                              |
          +------[wsl-chrome-bridge]-----+
                          |
@@ -45,6 +45,9 @@ wsl-chrome-bridge 會：
 - 在 `chrome-devtools-mcp` 模式下，透過 stdio pipe（OS pipe）接收/回傳 CDP 訊息
 - 在 `playwright-mcp` 模式下，於本機建立對應 port 的 WebSocket proxy 後轉發 CDP 訊息
 - 透過 PowerShell WebSocket relay 雙向轉發 CDP 訊息到 Windows Chrome
+
+> [!NOTE]
+> 我們在實測中觀察到，近期 `playwright-mcp` 版本可能改以 `--remote-debugging-pipe` 啟動 Chrome（官方 release note 未明確標註變更版本，可能介於 `0.0.71`～`0.0.72`）。為保留舊版相容性，bridge 仍同時支援 remote-debugging-port 與 pipe 兩種上游連線模式。
 
 
 ## 使用環境需求

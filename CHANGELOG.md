@@ -1,11 +1,13 @@
 wsl-chrome-bridge Change Log
 ============================
 
-0.3.1 under development
+0.3.1 2026-05-01
 -----------------------
- - Replaced startup debug hint with transport-only detection: `upstreamTransportMode` now reports `pipe` / `remote-debug-port` / `unknown` instead of MCP tool-name guesses.
- - Added explicit upstream pipe termination diagnostics for fd3/fd4 (`upstreamPipe event=end/error ...`) before finalize, to make upstream-close timing visible in debug logs.
- - Added explicit process signal diagnostics (`processSignal received signal=SIGINT|SIGTERM|SIGHUP`) to distinguish signal-triggered shutdown from transport-triggered shutdown.
+ - Fixed non-headless behavior where Windows Chrome could still be closed on MCP exit after newer `playwright-mcp` switched to `--remote-debugging-pipe`.
+   - Added non-headless pipe-mode delayed `Browser.close` interception for Playwright `id=-9999`: bridge now returns an immediate synthetic success response upstream, delays forwarding to Chrome by 200ms, and suppresses the delayed duplicate Chrome response from being forwarded upstream.
+   - Replaced startup debug hint with transport-only detection: `upstreamTransportMode` now reports `pipe` / `remote-debug-port` / `unknown` instead of MCP tool-name guesses.
+   - Added explicit upstream pipe termination diagnostics for fd3/fd4 (`upstreamPipe event=end/error ...`) before finalize, to make upstream-close timing visible in debug logs.
+   - Added explicit process signal diagnostics (`processSignal received signal=SIGINT|SIGTERM|SIGHUP`) to distinguish signal-triggered shutdown from transport-triggered shutdown.
 
 0.3.0 2026-04-21
 -----------------------

@@ -35,7 +35,7 @@ If you are upgrading from `0.1.0`, read the upgrade guide first: [UPGRADE.md](./
 ```text
 [Chrome DevTools MCP]             [Playwright MCP]
          |                              |
-      stdio pipe                remote-debugging-port
+      stdio pipe           remote-debugging-port/stdio pipe
          |                              |
          +------[wsl-chrome-bridge]-----+
                          |
@@ -51,6 +51,9 @@ If you are upgrading from `0.1.0`, read the upgrade guide first: [UPGRADE.md](./
 - In `chrome-devtools-mcp` mode, receive/return CDP messages through stdio pipe (OS pipe)
 - In `playwright-mcp` mode, create a local WebSocket proxy on the mapped port and forward CDP traffic through it
 - Relay CDP messages bidirectionally to Windows Chrome through PowerShell websocket relay
+
+> [!NOTE]
+> Based on our integration tests, recent `playwright-mcp` versions may launch Chrome with `--remote-debugging-pipe` (the official release notes do not clearly mark the exact version transition, and it may be between `0.0.71` and `0.0.72`). To preserve backward compatibility, the bridge continues to support both upstream connection styles: remote-debugging-port and pipe.
 
 ## Requirements
 
