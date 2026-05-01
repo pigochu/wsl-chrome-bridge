@@ -267,7 +267,9 @@ function requestKey(id: string | number, sessionId: string | null): string {
   return `${sessionId ?? "root"}::${String(id)}`;
 }
 
-function detectUpstreamHint(chromeArgs: string[]): "chrome-devtools-mcp" | "playwright-mcp" | "unknown" {
+function detectUpstreamTransportMode(
+  chromeArgs: string[]
+): "pipe" | "remote-debug-port" | "unknown" {
   const hasPipeMode = chromeArgs.includes("--remote-debugging-pipe");
   const hasRemoteDebugPort =
     chromeArgs.some((arg) => arg.startsWith("--remote-debugging-port=")) ||
@@ -276,10 +278,10 @@ function detectUpstreamHint(chromeArgs: string[]): "chrome-devtools-mcp" | "play
     chromeArgs.includes("--remote-debug-port");
 
   if (hasPipeMode && !hasRemoteDebugPort) {
-    return "chrome-devtools-mcp";
+    return "pipe";
   }
   if (!hasPipeMode && hasRemoteDebugPort) {
-    return "playwright-mcp";
+    return "remote-debug-port";
   }
   return "unknown";
 }
@@ -762,7 +764,7 @@ export function createBridgeRunner() {
     }
 
     writeDebug(`startupContext=${JSON.stringify({
-      upstreamHint: detectUpstreamHint(chromeArgs),
+      upstreamTransportMode: detectUpstreamTransportMode(chromeArgs),
       argv: chromeArgs,
       env: collectBridgeEnvSnapshot(env)
     })}`);
@@ -1757,7 +1759,10 @@ export function createBridgeRunner() {
       earlyWsMessages.length = 0;
 
       for (const signal of signals) {
-        const handler = () => finalize(0);
+        const handler = () => {
+          writeDebug(`processSignal received signal=${signal}`);
+          finalize(0);
+        };
         signalHandlers.set(signal, handler);
         process.on(signal, handler);
       }
@@ -1782,10 +1787,21 @@ export function createBridgeRunner() {
           }
         });
 
-        pipeIn.once("end", () => finalize(0));
-        pipeIn.once("error", () => finalize(1));
+        pipeIn.once("end", () => {
+          writeDebug("upstreamPipe event=end fd=3 reason=upstreamClosed");
+          finalize(0);
+        });
+        pipeIn.once("error", (error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          writeDebug(`upstreamPipe event=error fd=3 message=${message}`);
+          finalize(1);
+        });
       }
-      pipeOut?.once("error", () => finalize(1));
+      pipeOut?.once("error", (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        writeDebug(`upstreamPipe event=error fd=4 message=${message}`);
+        finalize(1);
+      });
     });
   };
 }

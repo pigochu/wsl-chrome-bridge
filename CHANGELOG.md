@@ -1,6 +1,12 @@
 wsl-chrome-bridge Change Log
 ============================
 
+0.3.1 under development
+-----------------------
+ - Replaced startup debug hint with transport-only detection: `upstreamTransportMode` now reports `pipe` / `remote-debug-port` / `unknown` instead of MCP tool-name guesses.
+ - Added explicit upstream pipe termination diagnostics for fd3/fd4 (`upstreamPipe event=end/error ...`) before finalize, to make upstream-close timing visible in debug logs.
+ - Added explicit process signal diagnostics (`processSignal received signal=SIGINT|SIGTERM|SIGHUP`) to distinguish signal-triggered shutdown from transport-triggered shutdown.
+
 0.3.0 2026-04-21
 -----------------------
  - Added Chrome instance reuse by matching `--user-data-dir` on Windows and reusing the matched instance `--remote-debugging-port` when available.
